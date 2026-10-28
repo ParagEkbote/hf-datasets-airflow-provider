@@ -11,6 +11,10 @@ def add_one(example):
     return {"value": example["value"] + 1}
 
 
+def keep_even(example):
+    return example["value"] % 2 == 0
+
+
 def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
     from airflow.providers.huggingface.operators import datasets as operators
 
@@ -84,6 +88,63 @@ def test_map_operator_maps_and_persists_arrow(tmp_path):
     assert mapped["value"] == [2, 3]
     assert result["format"] == "arrow"
     assert result["splits"]["dataset"]["rows"] == 2
+
+
+def test_filter_operator_uses_dataset_filter(tmp_path):
+    from airflow.providers.huggingface.operators.datasets import FilterDatasetOperator
+
+    source, output = tmp_path / "source", tmp_path / "filtered"
+    Dataset.from_dict({"value": [1, 2, 3, 4]}).save_to_disk(str(source))
+    operator = FilterDatasetOperator(
+        task_id="filter", input_uri=source.as_uri(), output_uri=output.as_uri(),
+        predicate="tests.unit.test_operators:keep_even",
+    )
+    reference = operator.execute({})
+    assert load_from_disk(str(output))["value"] == [2, 4]
+    assert reference["uri"] == output.as_uri()
+
+
+def test_assemble_operator_combines_named_artifacts(tmp_path):
+    from airflow.providers.huggingface.operators.datasets import AssembleDatasetOperator
+
+    train, valid, output = tmp_path / "train", tmp_path / "valid", tmp_path / "all"
+    Dataset.from_dict({"value": [1]}).save_to_disk(str(train))
+    Dataset.from_dict({"value": [2]}).save_to_disk(str(valid))
+    operator = AssembleDatasetOperator(
+        task_id="assemble", inputs={"train": train.as_uri(), "validation": valid.as_uri()},
+        output_uri=output.as_uri(),
+    )
+    reference = operator.execute({})
+    assembled = load_from_disk(str(output))
+    assert list(assembled) == ["train", "validation"]
+    assert assembled["validation"]["value"] == [2]
+    assert reference["splits"]["validation"]["rows"] == 1
+
+
+def test_stream_operator_bounds_transforms_and_persists(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    class FakeHook:
+        def __init__(self, conn_id): pass
+        def load_dataset(self, path, **kwargs):
+            assert kwargs["streaming"] is True
+            return iter({"text": f"  {'word ' * 100} {n}  "} for n in range(8))
+
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
+    from airflow.providers.huggingface.operators.datasets import StreamDatasetOperator
+    output = tmp_path / "streamed"
+    operator = StreamDatasetOperator(
+        task_id="stream", path="org/data", output_uri=output.as_uri(),
+        max_source_rows=5, max_output_rows=2,
+        transform="examples.transforms:clean_fineweb_document",
+        predicate="examples.transforms:is_long_fineweb_document",
+        feature_types={"text": "string", "word_count": "int64"},
+    )
+    reference = operator.execute({})
+    result = load_from_disk(str(output))
+    assert result.num_rows == 2
+    assert reference["source_rows_examined"] == 2
+    assert result.features["word_count"].dtype == "int64"
 
 
 def test_push_returns_commit_metadata_and_adds_asset_event(tmp_path, monkeypatch):

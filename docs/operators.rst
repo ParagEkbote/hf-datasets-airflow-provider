@@ -45,6 +45,31 @@ options such as ``batched``, ``batch_size``, ``num_proc``, and
 ``load_from_cache_file``. Datasets retains split structure and Arrow features
 where the transformation output permits it.
 
+FilterDatasetOperator
+---------------------
+
+``FilterDatasetOperator`` accepts an importable ``predicate`` in
+``module:function`` form and passes it to ``Dataset.filter`` (or
+``DatasetDict.filter``). Predicates return a boolean for each record, so row
+selection uses Datasets filtering semantics rather than dropping rows inside a
+mapping function.
+
+StreamDatasetOperator
+---------------------
+
+``StreamDatasetOperator`` owns bounded iterable loading and persistence. It
+accepts source limits, an importable row transform, an optional row predicate,
+and an explicit output ``feature_types`` schema (for example ``string`` and
+``int64``). It persists an Arrow artifact and returns its compact reference;
+the stream and row objects never enter XCom.
+
+AssembleDatasetOperator
+-----------------------
+
+``AssembleDatasetOperator`` accepts a mapping of split names to artifact
+references and persists a ``DatasetDict``. Split artifacts must all be visible
+to the executing worker under the same documented shared-storage contract.
+
 PushToHubOperator and assets
 ----------------------------
 
@@ -149,21 +174,7 @@ interoperability, but is not the internal handoff format.
 Examples
 --------
 
-The repository's ``examples/glue_in_memory.py`` DAG loads the GLUE MRPC
-training split without streaming, then combines and normalizes its sentence
-pairs while retaining the label. This demonstrates the ordinary in-memory
-``Dataset`` path through the load and map operators.
-
-``examples/streaming_fineweb_edu.py`` uses the hook from a task to load
-``HuggingFaceFW/fineweb-edu``'s ``sample-10BT`` configuration with
-``streaming=True``. It lazily normalizes whitespace, adds a word count, filters
-short documents, then persists at most 1,000 selected records as an Arrow
-artifact. FineWeb-Edu's sample config is a large multi-shard dataset; the
-bounded output keeps this runnable as an example. The example worker needs
-network access and enough disk for its bounded output.
-
-The standard load and map operators persist map-style datasets with
-``save_to_disk``. They do not currently persist a complete ``IterableDataset``;
-use a task-local streaming sink or a bounded sample as shown in the streaming
-example. Replace ``revision="main"`` with a dataset commit SHA when reproducible
-input is required.
+The provider-native DAGs are documented in ``examples/README.md``. They cover
+GLUE normalization, bounded FineWeb streaming, parallel SQuAD split processing
+and assembly, and a producer-consumer Asset workflow. All source revisions
+should be configured as commit SHAs before execution.

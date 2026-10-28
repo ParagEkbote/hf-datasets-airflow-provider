@@ -115,6 +115,102 @@ class MapDatasetOperator(BaseOperator):
         return {"uri": self.output_uri, "format": "arrow", "source_uri": _reference_uri(self.input_uri), **provenance, **saved}
 
 
+class FilterDatasetOperator(BaseOperator):
+    """Filter a persisted dataset using Datasets' supported filter semantics."""
+
+    template_fields = ("input_uri", "output_uri", "predicate")
+
+    def __init__(self, *, input_uri: str | dict[str, Any], output_uri: str,
+                 predicate: str, filter_kwargs: dict[str, Any] | None = None, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.input_uri, self.output_uri, self.predicate = input_uri, output_uri, predicate
+        self.filter_kwargs = filter_kwargs or {}
+
+    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+        if ":" not in self.predicate:
+            raise ValueError("predicate must use the import path 'package.module:function'")
+        module_name, function_name = self.predicate.split(":", 1)
+        function = getattr(importlib.import_module(module_name), function_name)
+        dataset = _load_artifact(self.input_uri)
+        filtered = dataset.filter(function, **self.filter_kwargs)
+        saved = _save(filtered, self.output_uri)
+        return {"uri": self.output_uri, "format": "arrow", "source_uri": _reference_uri(self.input_uri), **saved}
+
+
+class StreamDatasetOperator(BaseOperator):
+    """Read a bounded streaming sample, transform/filter it, and persist Arrow."""
+
+    template_fields = ("path", "name", "split", "revision", "output_uri", "transform", "predicate")
+
+    def __init__(self, *, path: str, output_uri: str, max_source_rows: int, max_output_rows: int,
+                 transform: str, name: str | None = None, split: str | None = None,
+                 revision: str | None = None, predicate: str | None = None,
+                 transform_kwargs: dict[str, Any] | None = None,
+                 feature_types: dict[str, str] | None = None,
+                 huggingface_conn_id: str | None = "huggingface_default", **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        if max_source_rows <= 0 or max_output_rows <= 0:
+            raise ValueError("Streaming row bounds must be positive")
+        self.path, self.output_uri = path, output_uri
+        self.max_source_rows, self.max_output_rows = max_source_rows, max_output_rows
+        self.transform, self.predicate = transform, predicate
+        self.name, self.split, self.revision = name, split, revision
+        self.transform_kwargs, self.feature_types = transform_kwargs or {}, feature_types or {}
+        self.huggingface_conn_id = huggingface_conn_id
+
+    @staticmethod
+    def _callable(spec: str):
+        if ":" not in spec:
+            raise ValueError("callable must use the import path 'package.module:function'")
+        module, name = spec.split(":", 1)
+        return getattr(importlib.import_module(module), name)
+
+    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+        from datasets import Dataset, Features, Value
+        kwargs = {"streaming": True}
+        if self.name is not None: kwargs["name"] = self.name
+        if self.split is not None: kwargs["split"] = self.split
+        if self.revision is not None: kwargs["revision"] = self.revision
+        stream = HuggingFaceDatasetsHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
+        transform = self._callable(self.transform)
+        predicate = self._callable(self.predicate) if self.predicate else None
+        rows, examined = [], 0
+        for row in stream:
+            if examined >= self.max_source_rows or len(rows) >= self.max_output_rows:
+                break
+            examined += 1
+            result = transform(row, **self.transform_kwargs)
+            if predicate is None or predicate(result):
+                rows.append(result)
+        if not rows:
+            raise ValueError("No streaming rows passed the configured bounds and filter")
+        features = Features({key: Value(kind) for key, kind in self.feature_types.items()}) if self.feature_types else None
+        dataset = Dataset.from_list(rows, features=features)
+        saved = _save(dataset, self.output_uri)
+        return {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
+                "revision": self.revision, "configuration": self.name, "split": self.split,
+                "streaming": True, "source_rows_examined": examined, **saved}
+
+
+class AssembleDatasetOperator(BaseOperator):
+    """Assemble named persisted split artifacts into a DatasetDict artifact."""
+
+    template_fields = ("inputs", "output_uri")
+
+    def __init__(self, *, inputs: dict[str, str | dict[str, Any]], output_uri: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        if not inputs:
+            raise ValueError("inputs must contain at least one named split artifact")
+        self.inputs, self.output_uri = inputs, output_uri
+
+    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+        from datasets import DatasetDict
+        parts = {name: _load_artifact(reference) for name, reference in self.inputs.items()}
+        assembled = DatasetDict(parts)
+        saved = _save(assembled, self.output_uri)
+        return {"uri": self.output_uri, "format": "arrow", "splits": list(parts), **saved}
+
+
 class PushToHubOperator(BaseOperator):
     """Synchronously publish an artifact and emit a successful Airflow Asset event."""
 
