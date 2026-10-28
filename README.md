@@ -48,4 +48,4 @@ with DAG("hf_dataset_pipeline", start_date=datetime(2024, 1, 1), schedule=None, 
 
 ## Examples
 
-The [`examples/`](examples/) directory contains a GLUE MRPC DAG that loads a small map-style dataset into memory and normalizes sentence pairs, plus a FineWeb-Edu DAG that streams a large corpus, lazily cleans and filters documents, and persists a bounded 1,000-row sample. Both examples use public data and do not publish to the Hub. See [example notes](docs/operators.rst#examples).
+The [`examples/`](examples/) directory contains a GLUE MRPC DAG that loads a small map-style dataset into memory and normalizes sentence pairs, plus a FineWeb-Edu DAG that streams a large corpus, lazily cleans and filters documents, and persists a bounded 1,000-row sample. See [example notes](docs/operators.rst#examples).
