@@ -38,6 +38,11 @@ def _artifact_path(uri: str) -> Path:
     return Path(unquote(parsed.path))
 
 
+def _is_hub_repo_id(path: str) -> bool:
+    """Tell a Hub ``org/name`` repository from a local path, as ``load_dataset`` does."""
+    return path.count("/") == 1 and not path.startswith((".", "/")) and not Path(path).exists()
+
+
 def _reference_uri(reference: str | dict[str, Any]) -> str:
     """Accept a URI or the compact artifact reference returned by an operator."""
     if isinstance(reference, dict):
@@ -88,22 +93,22 @@ class LoadDatasetOperator(BaseOperator):
         self.huggingface_conn_id, self.load_kwargs = huggingface_conn_id, load_kwargs or {}
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+        hook = HuggingFaceDatasetsHook(self.huggingface_conn_id)
+        revision = self.revision
+        if _is_hub_repo_id(self.path):
+            # Pin a moving ref such as "main" to its commit before loading, so the
+            # revision recorded in XCom is the one that was loaded.
+            revision = hook.get_dataset_info(self.path, self.revision).sha
         kwargs = dict(self.load_kwargs)
         kwargs.update(download_mode=self.download_mode)
         if self.name is not None: kwargs["name"] = self.name
         if self.split is not None: kwargs["split"] = self.split
-        if self.revision is not None: kwargs["revision"] = self.revision
+        if revision is not None: kwargs["revision"] = revision
         if self.cache_dir is not None: kwargs["cache_dir"] = self.cache_dir
-        dataset = HuggingFaceDatasetsHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
+        dataset = hook.load_dataset(self.path, **kwargs)
         saved = _save(dataset, self.output_uri)
-        result = {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
-                  "revision": self.revision, "configuration": self.name, "split": self.split, **saved}
-        if "/" in self.path and not self.path.startswith(("/", "./", "../")):
-            try:
-                result["revision"] = HuggingFaceDatasetsHook(self.huggingface_conn_id).get_dataset_info(self.path, self.revision).sha
-            except Exception:
-                self.log.warning("Could not resolve source revision metadata; using the requested revision value.")
-        return result
+        return {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
+                "revision": revision, "configuration": self.name, "split": self.split, **saved}
 
 
 class MapDatasetOperator(BaseOperator):

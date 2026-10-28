@@ -36,7 +36,7 @@ def keep_even(example):
 def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
     from airflow.providers.huggingface.operators import datasets as operators
 
-    seen = {}
+    seen, calls = {}, []
     dataset = Dataset.from_dict({"text": ["a", "b"]})
 
     class FakeHook:
@@ -44,10 +44,12 @@ def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
             pass
 
         def load_dataset(self, path, **kwargs):
+            calls.append("load_dataset")
             seen.update(path=path, **kwargs)
             return dataset
 
         def get_dataset_info(self, path, revision):
+            calls.append(("get_dataset_info", revision))
             return type("Info", (), {"sha": "abc123"})()
 
     monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
@@ -60,7 +62,9 @@ def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
     result = operator.execute({})
 
     assert seen["download_mode"] == "reuse_dataset_if_exists"
-    assert seen["revision"] == "main"
+    # The requested ref is pinned to a commit first, and that commit is what gets loaded and recorded.
+    assert calls == [("get_dataset_info", "main"), "load_dataset"]
+    assert seen["revision"] == "abc123"
     assert result["revision"] == "abc123"
     assert result["uri"] == output
     assert result["splits"]["dataset"]["rows"] == 2
@@ -80,6 +84,9 @@ def test_load_operator_can_force_redownload(tmp_path, monkeypatch):
             seen.update(kwargs)
             return Dataset.from_dict({"value": [1]})
 
+        def get_dataset_info(self, path, revision):
+            return type("Info", (), {"sha": "abc123"})()
+
     monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
     operator = LoadDatasetOperator(
         task_id="load", path="org/data", output_uri=(tmp_path / "data").as_uri(),
@@ -89,6 +96,29 @@ def test_load_operator_can_force_redownload(tmp_path, monkeypatch):
     operator.execute({})
 
     assert seen["download_mode"] == "force_redownload"
+
+
+def test_load_operator_does_not_resolve_revision_for_local_path(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    class FakeHook:
+        def __init__(self, conn_id):
+            pass
+
+        def load_dataset(self, path, **kwargs):
+            return Dataset.from_dict({"value": [1]})
+
+        def get_dataset_info(self, path, revision):
+            raise AssertionError("a local path must not be looked up on the Hub")
+
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "local" / "data").mkdir(parents=True)
+    operator = LoadDatasetOperator(task_id="load", path="local/data", output_uri=(tmp_path / "out").as_uri())
+
+    result = operator.execute({})
+
+    assert result["revision"] is None
 
 
 def test_map_operator_maps_and_persists_arrow(tmp_path):

@@ -24,8 +24,10 @@ LoadDatasetOperator
 (dataset configuration), ``split``, ``revision``, ``cache_dir``,
 ``download_mode`` and ``load_kwargs``. It persists the result and returns the
 artifact URI plus source ID, requested/resolved revision, configuration, split,
-row counts, and feature descriptions. Resolution of a source commit SHA is
-best-effort; pin a commit SHA in ``revision`` for reproducible inputs.
+row counts, and feature descriptions. For a Hub dataset, the operator resolves
+``revision`` (or the default branch) to a commit SHA before loading, loads that
+commit, and records it. The task fails if the revision cannot be resolved.
+Pin a commit SHA in ``revision`` for reproducible inputs across runs.
 
 The default ``reuse_dataset_if_exists`` mode reuses Datasets' valid cache.
 ``force_redownload`` forces a new download. ``cache_dir`` isolates cache data;
