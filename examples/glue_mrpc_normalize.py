@@ -32,7 +32,7 @@ Prerequisites
 ~~~~~~~~~~~~~
 * Install the provider::
 
-    pip install hf-datasets-airflow-provider
+    pip install "apache-airflow-providers-huggingface @ git+https://github.com/ParagEkbote/hf-datasets-airflow-provider"
 
 * Create an Airflow connection ``huggingface_default`` with type
   ``huggingface`` and a write-access token in the password field.
