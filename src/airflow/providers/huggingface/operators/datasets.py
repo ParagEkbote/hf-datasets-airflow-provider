@@ -230,7 +230,8 @@ class AssembleDatasetOperator(BaseOperator):
 class PushToHubOperator(BaseOperator):
     """Synchronously publish an artifact and emit a successful Airflow Asset event."""
 
-    template_fields = ("input_uri", "repo_id", "config", "commit_message", "card_template", "card_metadata", "card_description")
+    # repo_id is not templated: it defines the published Asset, which downstream Dags schedule on.
+    template_fields = ("input_uri", "config", "commit_message", "card_template", "card_metadata", "card_description")
 
     _CARD_START = "<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->"
     _CARD_END = "<!-- END AIRFLOW HUGGINGFACE DATASET CARD -->"
@@ -256,6 +257,8 @@ class PushToHubOperator(BaseOperator):
                 raise ValueError(f"Invalid dataset card metadata field or value: {key!r}.")
         if not dataset_card and card_update_policy != "preserve":
             raise ValueError("card_update_policy can be changed only when dataset_card=True.")
+        if "{{" in repo_id:
+            raise ValueError("repo_id cannot be templated: it defines the Asset that downstream Dags schedule on.")
         self.input_uri, self.repo_id, self.config = input_uri, repo_id, config
         self.private, self.commit_message = private, commit_message
         self.huggingface_conn_id, self.push_kwargs = huggingface_conn_id, push_kwargs or {}
@@ -263,7 +266,10 @@ class PushToHubOperator(BaseOperator):
         self.card_metadata, self.card_description = card_metadata or {}, card_description
         self.card_update_policy = card_update_policy
         self.published_asset = Asset(uri=f"huggingface://datasets/{repo_id}")
-        super().__init__(outlets=[self.published_asset], **kwargs)
+        outlets = kwargs.pop("outlets", None) or []
+        if not isinstance(outlets, (list, tuple)):
+            outlets = [outlets]
+        super().__init__(outlets=[*outlets, self.published_asset], **kwargs)
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
         dataset = _load_artifact(self.input_uri)

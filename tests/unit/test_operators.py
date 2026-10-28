@@ -14,8 +14,10 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+import pytest
 from datasets import Dataset, load_from_disk
 
+from airflow.sdk import Asset
 from airflow.providers.huggingface.operators.datasets import (
     LoadDatasetOperator,
     MapDatasetOperator,
@@ -265,3 +267,16 @@ def test_preserve_existing_readme_and_validate_policy(tmp_path, monkeypatch):
         assert "card_update_policy" in str(exc)
     else:
         raise AssertionError("invalid card policy must fail during initialization")
+
+
+def test_push_keeps_user_outlets_alongside_hub_asset():
+    extra = Asset("s3://bucket/training-manifest")
+
+    operator = PushToHubOperator(task_id="publish", input_uri="file:///tmp/in", repo_id="org/data", outlets=[extra])
+
+    assert [asset.uri for asset in operator.outlets] == ["s3://bucket/training-manifest", "huggingface://datasets/org/data"]
+
+
+def test_push_rejects_templated_repo_id():
+    with pytest.raises(ValueError, match="repo_id cannot be templated"):
+        PushToHubOperator(task_id="publish", input_uri="file:///tmp/in", repo_id="{{ params.repo }}")
