@@ -1,13 +1,15 @@
 # Apache Airflow provider for Hugging Face Datasets
 
-An independent provider MVP with operators to load, transform, and publish Hugging Face Datasets.
+![Hero Img](<docs/images/Apache Airflow ❤️ Hugging Face Datasets.png>)
+
+Apache Airflow provider with operators to load, transform, and publish Hugging Face Datasets.
 
 ## Compatibility
 
 This release targets Airflow 3.x (`apache-airflow>=3.0,<4`) and Python 3.10–3.13. It uses Datasets 3.x/4.x and `huggingface-hub` 0.x/1.x public APIs. Install it into the same Python environment as Airflow:
 
 ```bash
-pip install apache-airflow-providers-huggingface
+pip install hf-datasets-airflow-provider
 ```
 
 The root [`providers.yaml`](providers.yaml) records the provider inventory; runtime discovery uses Airflow's `apache_airflow_provider` entry point. See [connection setup](docs/connections.rst) and [operator guide](docs/operators.rst).

@@ -7,6 +7,10 @@ from airflow.providers.huggingface.operators.datasets import (
 )
 
 
+def add_one(example):
+    return {"value": example["value"] + 1}
+
+
 def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
     from airflow.providers.huggingface.operators import datasets as operators
 
@@ -71,7 +75,7 @@ def test_map_operator_maps_and_persists_arrow(tmp_path):
     Dataset.from_dict({"value": [1, 2]}).save_to_disk(str(source))
     operator = MapDatasetOperator(
         task_id="map", input_uri=source.as_uri(), output_uri=output.as_uri(),
-        transform="tests.unit.transforms:add_one",
+        transform="tests.unit.test_operators:add_one",
     )
 
     result = operator.execute({})
@@ -140,3 +144,47 @@ def test_failed_push_raises_without_event(tmp_path, monkeypatch):
         assert "upload failed" in str(exc)
     else:
         raise AssertionError("publication failure must fail the task")
+
+
+def test_push_can_create_dataset_card_with_compact_result(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    source = tmp_path / "input"
+    Dataset.from_dict({"value": [1]}).save_to_disk(str(source))
+    published = {}
+
+    class FakeHook:
+        def __init__(self, conn_id): pass
+        def get_dataset_readme(self, repo_id): return None
+        def push_to_hub(self, dataset, repo_id, **kwargs): return type("Commit", (), {"oid": "data-sha"})()
+        def upload_dataset_readme(self, repo_id, content, commit_message):
+            published.update(repo_id=repo_id, content=content)
+            return "card-sha"
+
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
+    operator = PushToHubOperator(task_id="publish", input_uri=source.as_uri(), repo_id="org/data",
+                                 dataset_card=True, card_metadata={"license": "mit"}, card_description="A dataset.")
+    result = operator.execute({})
+    assert "license: \"mit\"" in published["content"]
+    assert "A dataset." in published["content"]
+    assert result["dataset_card"] == {"enabled": True, "action": "created", "path": "README.md", "commit_sha": "card-sha"}
+
+
+def test_preserve_existing_readme_and_validate_policy(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    source = tmp_path / "input"
+    Dataset.from_dict({"value": [1]}).save_to_disk(str(source))
+    class FakeHook:
+        def __init__(self, conn_id): pass
+        def get_dataset_readme(self, repo_id): return "user docs"
+        def push_to_hub(self, dataset, repo_id, **kwargs): return None
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
+    operator = PushToHubOperator(task_id="publish", input_uri=source.as_uri(), repo_id="org/data", dataset_card=True)
+    assert operator.execute({})["dataset_card"]["action"] == "preserved"
+    try:
+        PushToHubOperator(task_id="bad", input_uri=source.as_uri(), repo_id="org/data", card_update_policy="overwrite")
+    except ValueError as exc:
+        assert "card_update_policy" in str(exc)
+    else:
+        raise AssertionError("invalid card policy must fail during initialization")

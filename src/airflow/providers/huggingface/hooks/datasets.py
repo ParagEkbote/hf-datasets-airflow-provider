@@ -83,3 +83,36 @@ class HuggingFaceDatasetsHook(BaseHook):
             return dataset.push_to_hub(repo_id, **kwargs)
         except Exception as exc:
             raise RuntimeError(f"Failed to publish dataset to {repo_id!r}: {self._safe_error(exc, token)}") from exc
+
+    def get_dataset_readme(self, repo_id: str) -> str | None:
+        """Return the root README if present, without treating access failures as absence."""
+        try:
+            from huggingface_hub import hf_hub_download
+            from huggingface_hub.utils import EntryNotFoundError
+        except ImportError as exc:
+            raise ImportError("Install `huggingface-hub` to manage dataset cards.") from exc
+        token = self.get_token()
+        try:
+            path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename="README.md", token=token)
+        except EntryNotFoundError:
+            return None
+        except Exception as exc:
+            raise RuntimeError(f"Failed to inspect README.md in {repo_id!r}: {self._safe_error(exc, token)}") from exc
+        from pathlib import Path
+        return Path(path).read_text(encoding="utf-8")
+
+    def upload_dataset_readme(self, repo_id: str, content: str, commit_message: str) -> str | None:
+        """Upload root README content and return its resulting commit SHA when available."""
+        try:
+            from huggingface_hub import HfApi
+        except ImportError as exc:
+            raise ImportError("Install `huggingface-hub` to publish dataset cards.") from exc
+        token = self.get_token()
+        try:
+            result = HfApi(token=token).upload_file(
+                path_or_fileobj=content.encode("utf-8"), path_in_repo="README.md", repo_id=repo_id,
+                repo_type="dataset", commit_message=commit_message,
+            )
+            return getattr(result, "oid", None)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to publish README.md to {repo_id!r}: {self._safe_error(exc, token)}") from exc

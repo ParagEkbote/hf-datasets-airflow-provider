@@ -56,6 +56,91 @@ repository ID and commit SHA in event metadata. The stable asset URI is
 ``huggingface://datasets/<repo_id>``; use the same ``Asset`` in a downstream
 DAG's schedule. A failed upload raises and emits no successful event.
 
+Dataset cards
+~~~~~~~~~~~~~
+
+Card generation is disabled by default. Set ``dataset_card=True`` to generate
+a root ``README.md``. ``card_metadata`` accepts the Hub fields ``pretty_name``
+and ``license`` (strings), plus ``language``, ``task_categories``, ``tags`` and
+``size_categories`` (lists of strings). The operator validates these types and
+does not infer licensing or other descriptive metadata. ``card_description``
+is human-authored text. The built-in card records the destination, observed
+split names, row counts and feature types, along with source ID, revision,
+configuration and split when present in the input artifact reference.
+
+``card_template`` may name a trusted Jinja template file. Its context contains
+only ``repo_id``, ``metadata``, ``description``, ``structure`` and ``provenance``;
+Jinja2 must be installed. Strict undefined-variable handling makes template
+mistakes fail before dataset publication.
+
+``card_update_policy`` defaults to ``preserve``: an existing README is left
+alone, while a missing README is created. ``update`` replaces only a region
+bracketed by ``<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->`` and
+``<!-- END AIRFLOW HUGGINGFACE DATASET CARD -->``; it fails if those markers
+are absent. ``replace`` explicitly replaces the whole README. Use it only when
+you intend to discard existing documentation. With cards disabled, no README
+is inspected or changed.
+
+Dataset and card commits are separate Hub operations and are not atomic. If
+the dataset upload succeeds and README upload fails, the task fails with the
+dataset commit (when available) in its error. A retry using ``preserve`` will
+not overwrite a README that appeared in the meantime. XCom reports the card
+action and separate card commit when the Hub returns one; it never includes
+README contents. The configured Hugging Face connection must have permission
+to create or update repository files. Missing source provenance is simply
+omitted.
+
+Example with card generation disabled (the default):
+
+.. code-block:: python
+
+   from airflow.providers.huggingface.operators.datasets import (
+       LoadDatasetOperator, MapDatasetOperator, PushToHubOperator,
+   )
+
+   load = LoadDatasetOperator(
+       task_id="load", path="nyu-mll/glue", name="mrpc", split="train",
+       output_uri="file:///mnt/shared/mrpc",
+   )
+   transform = MapDatasetOperator(
+       task_id="normalize_pairs", input_uri=load.output,
+       output_uri="file:///mnt/shared/mrpc_normalized",
+       transform="examples.transforms:normalize_glue_pair",
+       map_kwargs={"remove_columns": ["sentence1", "sentence2", "idx"]},
+   )
+   publish = PushToHubOperator(
+       task_id="publish", input_uri=transform.output,
+       repo_id="my-org/mrpc-normalized", dataset_card=False,
+   )
+   load >> transform >> publish
+
+Example generating a card while preserving a README already in the repository:
+
+.. code-block:: python
+
+   from airflow.providers.huggingface.operators.datasets import (
+       LoadDatasetOperator, MapDatasetOperator, PushToHubOperator,
+   )
+
+   load = LoadDatasetOperator(
+       task_id="load", path="nyu-mll/glue", name="mrpc", split="train",
+       output_uri="file:///mnt/shared/mrpc",
+   )
+   transform = MapDatasetOperator(
+       task_id="normalize_pairs", input_uri=load.output,
+       output_uri="file:///mnt/shared/mrpc_normalized",
+       transform="examples.transforms:normalize_glue_pair",
+       map_kwargs={"remove_columns": ["sentence1", "sentence2", "idx"]},
+   )
+   publish = PushToHubOperator(
+       task_id="publish", input_uri=transform.output,
+       repo_id="my-org/mrpc-normalized", dataset_card=True,
+       card_description="MRPC sentence pairs normalized into a single text field while retaining the similarity label.",
+       card_metadata={"pretty_name": "Normalized MRPC training pairs", "tags": ["glue", "mrpc", "text-classification"]},
+       card_update_policy="preserve",
+   )
+   load >> transform >> publish
+
 Uploads and transformations run in the task worker. Large datasets require
 adequate worker memory, temporary disk, and network bandwidth. Arrow artifacts
 are the native persisted format; Parquet is accepted as map input for

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
+import json
+import re
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -116,33 +118,85 @@ class MapDatasetOperator(BaseOperator):
 class PushToHubOperator(BaseOperator):
     """Synchronously publish an artifact and emit a successful Airflow Asset event."""
 
-    template_fields = ("input_uri", "repo_id", "config", "commit_message")
+    template_fields = ("input_uri", "repo_id", "config", "commit_message", "card_template", "card_metadata", "card_description")
+
+    _CARD_START = "<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->"
+    _CARD_END = "<!-- END AIRFLOW HUGGINGFACE DATASET CARD -->"
+    _CARD_FIELDS = {"pretty_name": str, "license": str, "language": list, "task_categories": list,
+                    "tags": list, "size_categories": list}
 
     def __init__(self, *, input_uri: str | dict[str, Any], repo_id: str, config: str | None = None,
                  private: bool | None = None, commit_message: str | None = None,
                  huggingface_conn_id: str | None = "huggingface_default", push_kwargs: dict[str, Any] | None = None,
+                 dataset_card: bool = False, card_template: str | None = None,
+                 card_metadata: dict[str, Any] | None = None, card_description: str | None = None,
+                 card_update_policy: str = "preserve",
                  **kwargs: Any) -> None:
+        if card_update_policy not in {"preserve", "update", "replace"}:
+            raise ValueError("card_update_policy must be one of: 'preserve', 'update', or 'replace'.")
+        if not isinstance(dataset_card, bool):
+            raise TypeError("dataset_card must be a bool.")
+        if card_metadata is not None and not isinstance(card_metadata, dict):
+            raise TypeError("card_metadata must be a dict or None.")
+        for key, value in (card_metadata or {}).items():
+            expected = self._CARD_FIELDS.get(key)
+            if expected is None or not isinstance(value, expected) or (expected is list and not all(isinstance(x, str) for x in value)):
+                raise ValueError(f"Invalid dataset card metadata field or value: {key!r}.")
+        if not dataset_card and card_update_policy != "preserve":
+            raise ValueError("card_update_policy can be changed only when dataset_card=True.")
         self.input_uri, self.repo_id, self.config = input_uri, repo_id, config
         self.private, self.commit_message = private, commit_message
         self.huggingface_conn_id, self.push_kwargs = huggingface_conn_id, push_kwargs or {}
+        self.dataset_card, self.card_template = dataset_card, card_template
+        self.card_metadata, self.card_description = card_metadata or {}, card_description
+        self.card_update_policy = card_update_policy
         self.published_asset = Asset(uri=f"huggingface://datasets/{repo_id}")
         super().__init__(outlets=[self.published_asset], **kwargs)
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
         dataset = _load_artifact(self.input_uri)
+        hook = HuggingFaceDatasetsHook(self.huggingface_conn_id)
+        card_result = {"enabled": False, "action": "disabled"}
+        existing_readme = None
+        if self.dataset_card:
+            existing_readme = hook.get_dataset_readme(self.repo_id)
+            if existing_readme is not None and self.card_update_policy == "preserve":
+                card_result = {"enabled": True, "action": "preserved", "path": "README.md"}
+        card_text = None
+        if self.dataset_card and card_result["action"] != "preserved":
+            card_text = self._render_card(dataset)
+            if existing_readme is not None and self.card_update_policy == "update":
+                pattern = re.compile(re.escape(self._CARD_START) + r".*?" + re.escape(self._CARD_END), re.S)
+                if not pattern.search(existing_readme):
+                    raise ValueError("Cannot safely update existing README.md: provider-managed card markers are missing. Add the markers or use card_update_policy='replace'.")
+                card_text = pattern.sub(lambda _: card_text.strip(), existing_readme)
+            elif existing_readme is not None and self.card_update_policy == "replace":
+                pass
+            elif existing_readme is not None:
+                raise ValueError("Existing README.md would be overwritten; select preserve, update, or explicit replace policy.")
         kwargs = dict(self.push_kwargs)
         if self.config is not None: kwargs["config_name"] = self.config
         if self.private is not None: kwargs["private"] = self.private
         if self.commit_message is not None: kwargs["commit_message"] = self.commit_message
-        result = HuggingFaceDatasetsHook(self.huggingface_conn_id).push_to_hub(dataset, self.repo_id, **kwargs)
+        result = hook.push_to_hub(dataset, self.repo_id, **kwargs)
         commit_url = getattr(result, "url", None)
         commit_sha = getattr(result, "oid", None)
         if isinstance(result, str):
             commit_url = result
         if commit_url and not commit_sha:
             commit_sha = commit_url.rstrip("/").rsplit("/", 1)[-1]
+        if card_text is not None:
+            action = ("replaced" if self.card_update_policy == "replace" else "updated") if existing_readme is not None else "created"
+            try:
+                card_commit = hook.upload_dataset_readme(self.repo_id, card_text, commit_message="Update dataset card")
+            except Exception as exc:
+                raise RuntimeError(f"Dataset was published to {self.repo_id!r} (commit {commit_sha or 'unknown'}), but README.md publication failed: {exc}") from exc
+            card_result = {"enabled": True, "action": action, "path": "README.md"}
+            if card_commit:
+                card_result["commit_sha"] = card_commit
         output = {"repository_id": self.repo_id, "commit_sha": commit_sha,
                   "url": f"https://huggingface.co/datasets/{self.repo_id}"}
+        output["dataset_card"] = card_result
         outlet_events = context.get("outlet_events")
         if outlet_events is not None:
             outlet_events[self.published_asset].extra = {"repository_id": self.repo_id, "commit_sha": commit_sha}
@@ -150,3 +204,38 @@ class PushToHubOperator(BaseOperator):
         output["source_repository_id"] = source_ref.get("repository_id")
         output["source_revision"] = source_ref.get("revision")
         return output
+
+    def _render_card(self, dataset: Any) -> str:
+        metadata = dict(self.card_metadata)
+        description = self.card_description
+        structure = {}
+        parts = dataset.items() if hasattr(dataset, "items") else [("dataset", dataset)]
+        for name, part in parts:
+            structure[str(name)] = {"rows": len(part), "features": {key: str(value) for key, value in part.features.items()}}
+        source = self.input_uri if isinstance(self.input_uri, dict) else {}
+        provenance = {key: source[key] for key in ("repository_id", "revision", "configuration", "split") if source.get(key) is not None}
+        if self.card_template:
+            path = Path(self.card_template)
+            try:
+                template_text = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise ValueError(f"Unable to read dataset card template {str(path)!r}: {exc}") from exc
+            try:
+                from jinja2 import Environment, StrictUndefined
+            except ImportError as exc:
+                raise ImportError("Custom dataset card templates require Jinja2.") from exc
+            body = Environment(undefined=StrictUndefined, autoescape=False).from_string(template_text).render(
+                repo_id=self.repo_id, metadata=metadata, description=description, structure=structure, provenance=provenance)
+            return body
+        yaml = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in metadata.items())
+        sections = ["---", yaml, "---", "", f"{self._CARD_START}", "# Dataset Description", "",
+                    description or f"Dataset published to `{self.repo_id}`."]
+        if provenance:
+            sections += ["", "## Source and Provenance", ""]
+            sections += [f"- **{key.replace('_', ' ').title()}:** {value}" for key, value in provenance.items()]
+        sections += ["", "## Dataset Structure", "", "| Split | Rows | Features |", "|---|---:|---|"]
+        sections += [f"| {name} | {info['rows']} | {', '.join(f'{k}: {v}' for k, v in info['features'].items())} |" for name, info in structure.items()]
+        if self.config:
+            sections += ["", "## Usage", "", "```python", "from datasets import load_dataset", f'dataset = load_dataset("{self.repo_id}", "{self.config}")', "```"]
+        sections += [self._CARD_END, ""]
+        return "\n".join(sections)

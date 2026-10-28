@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "apache-airflow-providers-huggingface"
+name = "hf-datasets-airflow-provider"
 version = "0.1.0"
 description = "Apache Airflow provider for Hugging Face Datasets"
 readme = "README.md"
