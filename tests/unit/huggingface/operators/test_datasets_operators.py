@@ -150,7 +150,7 @@ def test_fingerprint_and_split_checksum_mismatches_are_rejected(tmp_path):
     changed_reference = dict(reference, fingerprint="wrong")
     with pytest.raises(ValueError, match="artifact fingerprint"):
         _load_artifact(changed_reference)
-    split_path = tmp_path / "input.json.split-0.parquet"
+    split_path = tmp_path / "input.json.split-00000.parquet"
     split_path.write_bytes(b"corrupted")
     with pytest.raises(ValueError, match="split fingerprint"):
         _load_artifact(reference)
@@ -258,6 +258,53 @@ def test_state_store_write_failure_retry_does_not_push_twice(tmp_path, hub_depen
     retry_result = operator.execute({"task_state_store": Store()})
     push_to_hub.assert_called_once()
     assert retry_result["commit_sha"] == "a" * 40
+
+
+def test_load_retry_reuses_resolved_revision_from_task_state_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("AIRFLOW_CONN_HUGGINGFACE_TEST", '{"conn_type":"huggingface","password":"operator-test-token"}')
+    dataset = Dataset.from_dict({"value": [1]})
+    store_data = {}
+    class Store:
+        def get(self, key): return store_data.get(key)
+        def set(self, key, value): store_data[key] = value
+    ti = type("TaskInstance", (), {"dag_id": "d", "task_id": "load"})()
+    context = {"task_state_store": Store(), "ti": ti}
+    with (
+        patch("airflow.providers.huggingface.hooks.huggingface.HfApi", autospec=True) as api,
+        patch("airflow.providers.huggingface.hooks.huggingface.load_dataset", autospec=True) as load_dataset,
+    ):
+        api.return_value.dataset_info.return_value.sha = "pinned-sha"
+        load_dataset.return_value = dataset
+        first = LoadDatasetOperator(task_id="load", path="org/data", revision="main",
+                                    output_uri=(tmp_path / "first.json").as_uri(),
+                                    huggingface_conn_id="huggingface_test")
+        first_result = first.execute(context)
+        second = LoadDatasetOperator(task_id="load", path="org/data", revision="other-tag",
+                                     output_uri=(tmp_path / "second.json").as_uri(),
+                                     huggingface_conn_id="huggingface_test")
+        second_result = second.execute(context)
+    assert first_result["revision"] == second_result["revision"] == "pinned-sha"
+    api.return_value.dataset_info.assert_called_once_with("org/data", revision="main")
+    assert [call.kwargs["revision"] for call in load_dataset.call_args_list] == ["pinned-sha", "pinned-sha"]
+
+
+def test_push_preserves_user_outlets_and_changes_commit_for_new_fingerprint(tmp_path, hub_dependencies):
+    hf_api, push_to_hub = hub_dependencies
+    reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "input.json").as_uri())
+    caller_asset = type("Asset", (), {"uri": "custom://caller"})()
+    first_commit = commit_info(oid="1" * 40)
+    second_commit = commit_info(oid="2" * 40)
+    push_to_hub.side_effect = [first_commit, second_commit]
+    operator = PushToHubOperator(task_id="publish", input_uri=reference, repo_id="org/data",
+                                 huggingface_conn_id="huggingface_test", outlets=[caller_asset])
+    assert caller_asset in operator.outlets
+    assert operator.published_asset in operator.outlets
+    operator.execute({})
+    changed = _save(Dataset.from_dict({"value": [2]}), (tmp_path / "changed.json").as_uri())
+    operator.input_uri = changed
+    result = operator.execute({})
+    assert push_to_hub.call_count == 2
+    assert result["commit_sha"] == second_commit.oid
 
 
 def test_dataset_card_is_created_and_published_after_data_commit(tmp_path, hub_dependencies):

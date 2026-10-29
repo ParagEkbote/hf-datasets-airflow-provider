@@ -95,7 +95,11 @@ with DAG(dag_id="huggingface_system_durable", tags=["huggingface", "system-test"
         fingerprint = mapped_ref["fingerprint"]
         marker = f"airflow-artifact-sha256:{fingerprint}"
         commits = HuggingFaceHook(CONN_ID).get_conn().list_repo_commits(REPO_ID, repo_type="dataset")
-        matches = [commit for commit in commits if marker in (commit.message or "")]
+        matches = [
+            commit
+            for commit in commits
+            if marker in (getattr(commit, "message", None) or getattr(commit, "commit_message", ""))
+        ]
         assert len(matches) == 1
         assert publication["commit_sha"] == matches[0].oid
 
