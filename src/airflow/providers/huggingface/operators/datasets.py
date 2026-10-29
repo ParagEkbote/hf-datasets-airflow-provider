@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from pathlib import Path
 from typing import Any, Callable
 
@@ -184,6 +183,11 @@ def _task_key(context: dict[str, Any], prefix: str, identity: str) -> str:
     return f"huggingface-{prefix}:{dag_id}:{task_id}:{identity}"
 
 
+def _is_hub_repo(path: str) -> bool:
+    """Match a Hub dataset repo ID without treating an existing local path as remote."""
+    return path.count("/") == 1 and not path.startswith((".", "/")) and not Path(path).exists()
+
+
 class LoadDatasetOperator(BaseOperator):
     """Load a dataset revision and persist it as a Parquet artifact."""
 
@@ -214,9 +218,10 @@ class LoadDatasetOperator(BaseOperator):
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
         hook = HuggingFaceHook(self.huggingface_conn_id)
         requested_revision = self.revision
-        is_hub_repo = "/" in self.path and not self.path.startswith(("/", "./", "../"))
+        is_hub_repo = _is_hub_repo(self.path)
         state = context.get("task_state_store") if self.durable else None
-        state_key = _task_key(context, "load", self.path)
+        state_identity = json.dumps([self.path, requested_revision], separators=(",", ":"))
+        state_key = _task_key(context, "load", state_identity)
         revision = state.get(state_key) if state is not None else None
         if revision is None:
             revision = requested_revision
@@ -241,6 +246,102 @@ class LoadDatasetOperator(BaseOperator):
             "revision": revision,
             "configuration": self.name,
             "split": self.split,
+        }
+        return _save(dataset, self.output_uri, metadata)
+
+
+class StreamDatasetOperator(BaseOperator):
+    """Read a bounded streaming sample, transform/filter rows, and persist it."""
+
+    template_fields = ("path", "name", "split", "revision", "output_uri", "transform_kwargs")
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        output_uri: str,
+        max_source_rows: int,
+        max_output_rows: int,
+        transform: Callable[..., dict[str, Any]],
+        name: str | None = None,
+        split: str | None = None,
+        revision: str | None = None,
+        predicate: Callable[..., bool] | None = None,
+        transform_kwargs: dict[str, Any] | None = None,
+        feature_types: dict[str, str] | None = None,
+        huggingface_conn_id: str | None = "huggingface_default",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        if max_source_rows <= 0 or max_output_rows <= 0:
+            raise ValueError("Streaming row bounds must be positive")
+        if not callable(transform):
+            raise TypeError("transform must be a callable")
+        if predicate is not None and not callable(predicate):
+            raise TypeError("predicate must be a callable or None")
+        self.path, self.output_uri = path, output_uri
+        self.max_source_rows, self.max_output_rows = max_source_rows, max_output_rows
+        self.transform, self.predicate = transform, predicate
+        self.name, self.split, self.revision = name, split, revision
+        self.transform_kwargs = transform_kwargs or {}
+        self.feature_types = feature_types or {}
+        self.huggingface_conn_id = huggingface_conn_id
+
+    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+        hook = HuggingFaceHook(self.huggingface_conn_id)
+        revision = self.revision
+        is_hub_repo = _is_hub_repo(self.path)
+        if is_hub_repo:
+            revision = hook.get_dataset_info(self.path, revision).sha
+
+        kwargs: dict[str, Any] = {"streaming": True}
+        if self.name is not None:
+            kwargs["name"] = self.name
+        if self.split is not None:
+            kwargs["split"] = self.split
+        if revision is not None:
+            kwargs["revision"] = revision
+        stream = hook.load_dataset(self.path, **kwargs)
+
+        rows_by_split: dict[str, list[dict[str, Any]]] = {}
+        examined = 0
+        streams = stream.items() if isinstance(stream, dict) else [("dataset", stream)]
+        output_count = 0
+        for split_name, split_stream in streams:
+            split_rows: list[dict[str, Any]] = []
+            iterator = iter(split_stream)
+            while examined < self.max_source_rows and output_count < self.max_output_rows:
+                try:
+                    row = next(iterator)
+                except StopIteration:
+                    break
+                examined += 1
+                transformed = self.transform(row, **self.transform_kwargs)
+                if not isinstance(transformed, dict):
+                    raise TypeError("stream transform must return a dict")
+                if self.predicate is None or self.predicate(transformed):
+                    split_rows.append(transformed)
+                    output_count += 1
+            if split_rows:
+                rows_by_split[str(split_name)] = split_rows
+            if examined >= self.max_source_rows or output_count >= self.max_output_rows:
+                break
+        if not rows_by_split:
+            raise ValueError("No streaming rows passed the configured bounds and filter")
+
+        features = Features({key: Value(kind) for key, kind in self.feature_types.items()}) if self.feature_types else None
+        parts = {
+            name: Dataset.from_list(rows, features=features)
+            for name, rows in rows_by_split.items()
+        }
+        dataset = parts["dataset"] if list(parts) == ["dataset"] else DatasetDict(parts)
+        metadata = {
+            "repository_id": self.path if is_hub_repo else None,
+            "revision": revision,
+            "configuration": self.name,
+            "split": self.split,
+            "streaming": True,
+            "source_rows_examined": examined,
         }
         return _save(dataset, self.output_uri, metadata)
 
@@ -281,19 +382,7 @@ class MapDatasetOperator(BaseOperator):
 class PushToHubOperator(BaseOperator):
     """Synchronously publish an artifact and emit its successful asset event."""
 
-    template_fields = (
-        "input_uri", "repo_id", "config", "commit_message", "card_template", "card_metadata", "card_description"
-    )
-    _CARD_START = "<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->"
-    _CARD_END = "<!-- END AIRFLOW HUGGINGFACE DATASET CARD -->"
-    _CARD_FIELDS = {
-        "pretty_name": str,
-        "license": str,
-        "language": list,
-        "task_categories": list,
-        "tags": list,
-        "size_categories": list,
-    }
+    template_fields = ("input_uri", "config", "commit_message")
 
     def __init__(
         self,
@@ -305,37 +394,19 @@ class PushToHubOperator(BaseOperator):
         commit_message: str | None = None,
         huggingface_conn_id: str | None = "huggingface_default",
         push_kwargs: dict[str, Any] | None = None,
-        dataset_card: bool = False,
-        card_template: str | None = None,
-        card_metadata: dict[str, Any] | None = None,
-        card_description: str | None = None,
-        card_update_policy: str = "preserve",
         **kwargs: Any,
     ) -> None:
-        if card_update_policy not in {"preserve", "update", "replace"}:
-            raise ValueError("card_update_policy must be one of: 'preserve', 'update', or 'replace'.")
-        if not isinstance(dataset_card, bool):
-            raise TypeError("dataset_card must be a bool.")
-        if card_metadata is not None and not isinstance(card_metadata, dict):
-            raise TypeError("card_metadata must be a dict or None.")
-        for key, value in (card_metadata or {}).items():
-            expected = self._CARD_FIELDS.get(key)
-            if expected is None or not isinstance(value, expected) or (
-                expected is list and not all(isinstance(item, str) for item in value)
-            ):
-                raise ValueError(f"Invalid dataset card metadata field or value: {key!r}.")
-        if not dataset_card and card_update_policy != "preserve":
-            raise ValueError("card_update_policy can be changed only when dataset_card=True.")
         if "{{" in repo_id:
             raise ValueError("repo_id cannot be templated: it defines the Asset that downstream DAGs schedule on.")
         self.input_uri, self.repo_id, self.config = input_uri, repo_id, config
         self.private, self.commit_message = private, commit_message
         self.huggingface_conn_id, self.push_kwargs = huggingface_conn_id, push_kwargs or {}
-        self.dataset_card, self.card_template = dataset_card, card_template
-        self.card_metadata, self.card_description = card_metadata or {}, card_description
-        self.card_update_policy = card_update_policy
         self.published_asset = Asset(uri=f"hf://datasets/{repo_id}")
-        user_outlets = kwargs.pop("outlets", None) or []
+        user_outlets = kwargs.pop("outlets", None)
+        if user_outlets is None:
+            user_outlets = []
+        elif not isinstance(user_outlets, (list, tuple)):
+            user_outlets = [user_outlets]
         super().__init__(outlets=[*user_outlets, self.published_asset], **kwargs)
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
@@ -354,19 +425,6 @@ class PushToHubOperator(BaseOperator):
                 return prior_result
 
         hook = HuggingFaceHook(self.huggingface_conn_id)
-        existing_readme = hook.get_dataset_readme(self.repo_id) if self.dataset_card else None
-        card_text = None
-        card_result = {"enabled": False, "action": "disabled"}
-        if self.dataset_card and existing_readme is not None and self.card_update_policy == "preserve":
-            card_result = {"enabled": True, "action": "preserved", "path": "README.md"}
-        elif self.dataset_card:
-            card_text = self._render_card(dataset)
-            if existing_readme is not None and self.card_update_policy == "update":
-                pattern = re.compile(re.escape(self._CARD_START) + r".*?" + re.escape(self._CARD_END), re.S)
-                if not pattern.search(existing_readme):
-                    raise ValueError("Cannot safely update README.md: provider-managed card markers are missing.")
-                card_text = pattern.sub(lambda _: card_text.strip(), existing_readme)
-
         commit = hook.find_publication_commit(self.repo_id, fingerprint)
         if commit is None:
             kwargs = dict(self.push_kwargs)
@@ -378,13 +436,6 @@ class PushToHubOperator(BaseOperator):
             kwargs["commit_message"] = f"{message} [{marker}]"
             commit = hook.push_to_hub(dataset, self.repo_id, **kwargs)
 
-        if card_text is not None:
-            action = "created" if existing_readme is None else self.card_update_policy + "d"
-            card_sha = hook.upload_dataset_readme(self.repo_id, card_text, commit_message="Update dataset card")
-            card_result = {"enabled": True, "action": action, "path": "README.md"}
-            if card_sha:
-                card_result["commit_sha"] = card_sha
-
         result = {
             "repository_id": self.repo_id,
             "commit_sha": commit.oid,
@@ -393,7 +444,6 @@ class PushToHubOperator(BaseOperator):
             "fingerprint": fingerprint,
             "source_repository_id": source.get("repository_id"),
             "source_revision": source.get("revision"),
-            "dataset_card": card_result,
         }
         if state is not None:
             state.set(state_key, result)
@@ -409,39 +459,3 @@ class PushToHubOperator(BaseOperator):
                 "commit_url": publication["commit_url"],
                 "fingerprint": publication["fingerprint"],
             }
-
-    def _render_card(self, dataset: Dataset | DatasetDict) -> str:
-        structure = {
-            name: {"rows": len(part), "features": {key: str(value) for key, value in part.features.items()}}
-            for name, part in _dataset_parts(dataset)
-        }
-        source = self.input_uri if isinstance(self.input_uri, dict) else {}
-        provenance = {
-            key: source[key]
-            for key in ("repository_id", "revision", "configuration", "split")
-            if source.get(key) is not None
-        }
-        if self.card_template:
-            template_text = Path(self.card_template).read_text(encoding="utf-8")
-            from jinja2 import Environment, StrictUndefined
-
-            return Environment(undefined=StrictUndefined, autoescape=False).from_string(template_text).render(
-                repo_id=self.repo_id,
-                metadata=self.card_metadata,
-                description=self.card_description,
-                structure=structure,
-                provenance=provenance,
-            )
-        yaml = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in self.card_metadata.items())
-        lines = ["---", yaml, "---", "", self._CARD_START, "# Dataset Description", ""]
-        lines += [self.card_description or f"Dataset published to `{self.repo_id}`.", "", "## Dataset Structure", ""]
-        lines += ["| Split | Rows | Features |", "|---|---:|---|"]
-        lines += [
-            f"| {name} | {info['rows']} | {', '.join(f'{key}: {value}' for key, value in info['features'].items())} |"
-            for name, info in structure.items()
-        ]
-        if provenance:
-            lines += ["", "## Source and Provenance", ""]
-            lines += [f"- **{key.replace('_', ' ').title()}:** {value}" for key, value in provenance.items()]
-        lines += ["", self._CARD_END, ""]
-        return "\n".join(lines)

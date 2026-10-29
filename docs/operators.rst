@@ -2,8 +2,9 @@ Operators
 =========
 
 The initial public operator API is ``LoadDatasetOperator``,
-``MapDatasetOperator``, and ``PushToHubOperator``. The operators exchange the
-manifest and split Parquet objects described in :doc:`artifacts`.
+``MapDatasetOperator``, ``StreamDatasetOperator``, and
+``PushToHubOperator``. The operators exchange the manifest and split Parquet
+objects described in :doc:`artifacts`.
 
 LoadDatasetOperator
 -------------------
@@ -11,16 +12,14 @@ LoadDatasetOperator
 ``LoadDatasetOperator`` accepts ``path``, ``output_uri``, optional ``name``
 (dataset configuration), ``split``, ``revision``, ``cache_dir``,
 ``download_mode`` and ``load_kwargs``. It persists the result and returns the
-artifact URI plus source ID, requested/resolved revision, configuration, split,
-row counts, and feature descriptions. Resolution of a source commit SHA is
-best-effort; pin a commit SHA in ``revision`` for reproducible inputs.
+artifact URI plus source ID, resolved revision, configuration, split, row
+counts, and feature descriptions. It resolves a Hub source to a commit before
+loading; pin a commit SHA in ``revision`` for reproducible inputs.
 
 The default ``reuse_dataset_if_exists`` mode reuses Datasets' valid cache.
 ``force_redownload`` forces a new download. ``cache_dir`` isolates cache data;
 it is separate from the output artifact destination. Keeping a stable cache
 directory allows retries and cleared task instances to reuse downloaded data.
-Run-specific cache directories are possible by templating ``cache_dir`` but are
-not the default.
 
 MapDatasetOperator
 ------------------
@@ -31,6 +30,20 @@ when the task worker executes. The operator does not template or import the
 callable from a string. ``transform_kwargs`` are passed as Datasets ``fn_kwargs``;
 ``map_kwargs`` are passed to ``Dataset.map`` or ``DatasetDict.map``. The output
 preserves compatible provenance and records a new artifact fingerprint.
+
+StreamDatasetOperator
+---------------------
+
+``StreamDatasetOperator`` loads with Datasets ``streaming=True`` and requires
+positive ``max_source_rows`` and ``max_output_rows`` bounds. It applies a
+Python ``transform`` to each row and can optionally apply a Python ``predicate``
+to each transformed row. Both callables must be available at DAG parse time and
+on workers. ``transform_kwargs`` are passed to the transform. ``feature_types``
+can declare a ``Features`` schema for the materialized sample. The selected
+bounded rows are persisted through the same manifest and per-split Parquet
+artifact contract as load and map tasks; dataset rows are never put in XCom.
+An empty result fails the task. The resulting feature types must be supported
+by the Parquet artifact writer.
 
 PushToHubOperator
 -----------------
@@ -47,34 +60,8 @@ The commit message includes an artifact fingerprint marker. Airflow 3.3 and
 later task state store support caches the result when that facility is
 available. The marker also lets a retry find a successfully created data commit
 if the worker exited before saving task state. The task emits an asset event
-with the same commit SHA and URL only after successful publication (including
-optional card handling).
-
-Optional card parameters retain the existing README behavior:
-
-* ``dataset_card`` enables a generated ``README.md``; default ``False``.
-* ``card_metadata`` accepts ``pretty_name`` and ``license`` strings, and
-  ``language``, ``task_categories``, ``tags``, and ``size_categories`` lists
-  of strings.
-* ``card_description`` supplies human-authored description text.
-* ``card_template`` selects a trusted local Jinja2 template. Install Jinja2
-  when using it. Its context is ``repo_id``, ``metadata``, ``description``,
-  ``structure``, and ``provenance``.
-* ``card_update_policy`` is ``preserve`` (default), ``update`` (replace only
-  provider marked content), or ``replace`` (replace the whole README).
-
-A card upload is a separate Hub commit. If it fails, the task fails and emits
-no event, while retry recovery prevents the dataset data commit from being
-created again. Connection and Hub errors retain their original exception types.
-
-Streaming decision
-------------------
-
-Streaming, standalone filtering, and split assembly operators are not part of
-the initial v1 API. A streaming ``IterableDataset`` cannot be written through
-the current materialized Parquet handoff without changing memory and failure
-semantics. Use a separately designed streaming-to-durable-artifact workflow
-when one is needed; this release does not claim streaming support.
+with the same commit SHA and URL only after successful publication. Dataset
+card generation and README updates are not part of this operator's scope.
 
 Example
 -------

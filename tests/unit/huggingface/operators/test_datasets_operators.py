@@ -25,6 +25,7 @@ from airflow.providers.huggingface.operators.datasets import (
     LoadDatasetOperator,
     MapDatasetOperator,
     PushToHubOperator,
+    StreamDatasetOperator,
     _load_artifact,
     _save,
 )
@@ -53,11 +54,6 @@ def hub_dependencies(monkeypatch):
     ):
         hf_api.return_value.list_repo_commits.return_value = []
         yield hf_api, push_to_hub
-
-
-def missing_readme_error():
-    from huggingface_hub.utils import EntryNotFoundError
-    return EntryNotFoundError()
 
 
 def test_load_pins_and_records_resolved_revision_and_honors_download_mode(tmp_path, monkeypatch):
@@ -93,6 +89,94 @@ def test_non_hub_load_does_not_resolve_hub_revision(tmp_path):
         result = operator.execute({})
     load_dataset.assert_called_once_with("csv", download_mode="reuse_dataset_if_exists")
     assert result["revision"] is None
+
+
+def test_stream_operator_resolves_revision_and_enforces_both_bounds(tmp_path):
+    rows = [{"value": value} for value in range(1, 10)]
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+        hook = hook_type.return_value
+        hook.get_dataset_info.return_value.sha = "pinned-stream-sha"
+        hook.load_dataset.return_value = iter(rows)
+        operator = StreamDatasetOperator(
+            task_id="stream",
+            path="org/data",
+            split="train",
+            revision="main",
+            output_uri=(tmp_path / "stream.json").as_uri(),
+            max_source_rows=5,
+            max_output_rows=2,
+            transform=lambda row, increment: {"value": row["value"] + increment},
+            transform_kwargs={"increment": 1},
+            predicate=lambda row: row["value"] % 2 == 0,
+            feature_types={"value": "int64"},
+            huggingface_conn_id=None,
+        )
+        reference = operator.execute({})
+
+    hook.get_dataset_info.assert_called_once_with("org/data", "main")
+    hook.load_dataset.assert_called_once_with(
+        "org/data", streaming=True, split="train", revision="pinned-stream-sha"
+    )
+    dataset = _load_artifact(reference)
+    assert dataset["value"] == [2, 4]
+    assert dataset.features["value"].dtype == "int64"
+    assert reference["revision"] == "pinned-stream-sha"
+    assert reference["source_rows_examined"] == 3
+    assert reference["streaming"] is True
+
+
+def test_stream_operator_preserves_split_names_for_unspecified_split(tmp_path):
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+        hook = hook_type.return_value
+        hook.load_dataset.return_value = {
+            "train": iter([{"value": 1}, {"value": 2}]),
+            "validation": iter([{"value": 3}]),
+        }
+        operator = StreamDatasetOperator(
+            task_id="stream_splits",
+            path="csv",
+            output_uri=(tmp_path / "splits.json").as_uri(),
+            max_source_rows=3,
+            max_output_rows=3,
+            transform=lambda row: row,
+            huggingface_conn_id=None,
+        )
+        reference = operator.execute({})
+
+    dataset = _load_artifact(reference)
+    assert list(dataset) == ["train", "validation"]
+    assert dataset["train"]["value"] == [1, 2]
+    assert dataset["validation"]["value"] == [3]
+
+
+@pytest.mark.parametrize("limit", [0, -1])
+def test_stream_operator_requires_positive_row_bounds(tmp_path, limit):
+    with pytest.raises(ValueError, match="row bounds must be positive"):
+        StreamDatasetOperator(
+            task_id="invalid_stream",
+            path="csv",
+            output_uri=(tmp_path / "invalid.json").as_uri(),
+            max_source_rows=limit,
+            max_output_rows=1,
+            transform=lambda row: row,
+        )
+
+
+def test_stream_operator_fails_when_no_rows_pass_the_filter(tmp_path):
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+        hook_type.return_value.load_dataset.return_value = iter([{"value": 1}, {"value": 2}])
+        operator = StreamDatasetOperator(
+            task_id="empty_stream",
+            path="csv",
+            output_uri=(tmp_path / "empty.json").as_uri(),
+            max_source_rows=2,
+            max_output_rows=2,
+            transform=lambda row: row,
+            predicate=lambda row: False,
+            huggingface_conn_id=None,
+        )
+        with pytest.raises(ValueError, match="No streaming rows"):
+            operator.execute({})
 
 
 def test_parquet_manifest_preserves_order_features_and_dataset_splits(tmp_path):
@@ -273,7 +357,10 @@ def test_load_retry_reuses_resolved_revision_from_task_state_store(tmp_path, mon
         patch("airflow.providers.huggingface.hooks.huggingface.HfApi", autospec=True) as api,
         patch("airflow.providers.huggingface.hooks.huggingface.load_dataset", autospec=True) as load_dataset,
     ):
-        api.return_value.dataset_info.return_value.sha = "pinned-sha"
+        api.return_value.dataset_info.side_effect = [
+            type("Info", (), {"sha": "pinned-sha"})(),
+            type("Info", (), {"sha": "repinned-sha"})(),
+        ]
         load_dataset.return_value = dataset
         first = LoadDatasetOperator(task_id="load", path="org/data", revision="main",
                                     output_uri=(tmp_path / "first.json").as_uri(),
@@ -283,9 +370,15 @@ def test_load_retry_reuses_resolved_revision_from_task_state_store(tmp_path, mon
                                      output_uri=(tmp_path / "second.json").as_uri(),
                                      huggingface_conn_id="huggingface_test")
         second_result = second.execute(context)
-    assert first_result["revision"] == second_result["revision"] == "pinned-sha"
-    api.return_value.dataset_info.assert_called_once_with("org/data", revision="main")
-    assert [call.kwargs["revision"] for call in load_dataset.call_args_list] == ["pinned-sha", "pinned-sha"]
+    assert first_result["revision"] == "pinned-sha"
+    assert second_result["revision"] == "repinned-sha"
+    assert api.return_value.dataset_info.call_args_list == [
+        ( ("org/data",), {"revision": "main"} ),
+        ( ("org/data",), {"revision": "other-tag"} ),
+    ]
+    assert [call.kwargs["revision"] for call in load_dataset.call_args_list] == [
+        "pinned-sha", "repinned-sha"
+    ]
 
 
 def test_push_preserves_user_outlets_and_changes_commit_for_new_fingerprint(tmp_path, hub_dependencies):
@@ -305,45 +398,6 @@ def test_push_preserves_user_outlets_and_changes_commit_for_new_fingerprint(tmp_
     result = operator.execute({})
     assert push_to_hub.call_count == 2
     assert result["commit_sha"] == second_commit.oid
-
-
-def test_dataset_card_is_created_and_published_after_data_commit(tmp_path, hub_dependencies):
-    hf_api, push_to_hub = hub_dependencies
-    reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "card.json").as_uri())
-    commit = commit_info(oid="b" * 40)
-    push_to_hub.return_value = commit
-    hf_api.return_value.upload_file.return_value = commit_info(oid="e" * 40)
-    with patch("airflow.providers.huggingface.hooks.huggingface.hf_hub_download", autospec=True,
-               side_effect=missing_readme_error()):
-        operator = PushToHubOperator(task_id="card", input_uri=reference, repo_id="org/data", dataset_card=True,
-                                     card_metadata={"license": "mit"}, card_description="A test dataset",
-                                     huggingface_conn_id="huggingface_test")
-        result = operator.execute({})
-    uploaded = hf_api.return_value.upload_file.call_args.kwargs["path_or_fileobj"].decode()
-    assert "license: \"mit\"" in uploaded
-    assert "A test dataset" in uploaded
-    assert result["dataset_card"] == {
-        "enabled": True, "action": "created", "path": "README.md", "commit_sha": "e" * 40
-    }
-
-
-def test_existing_card_is_preserved_and_card_policy_is_validated(tmp_path, hub_dependencies):
-    _, push_to_hub = hub_dependencies
-    reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "preserve.json").as_uri())
-    commit = commit_info(oid="b" * 40)
-    push_to_hub.return_value = commit
-    readme = tmp_path / "README.md"
-    readme.write_text("user documentation")
-    with patch("airflow.providers.huggingface.hooks.huggingface.hf_hub_download", autospec=True,
-               return_value=str(readme)) as download:
-        operator = PushToHubOperator(task_id="preserve", input_uri=reference, repo_id="org/data", dataset_card=True,
-                                     huggingface_conn_id="huggingface_test")
-        result = operator.execute({})
-        download.assert_called_once()
-    assert result["dataset_card"]["action"] == "preserved"
-    with pytest.raises(ValueError, match="card_update_policy"):
-        PushToHubOperator(task_id="invalid_card", input_uri=reference, repo_id="org/data",
-                          card_update_policy="replace")
 
 
 def test_object_storage_memory_scheme_handoff(monkeypatch):

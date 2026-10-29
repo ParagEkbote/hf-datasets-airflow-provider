@@ -2,8 +2,8 @@ Apache Airflow Hugging Face Provider
 ====================================
 
 The Hugging Face provider connects Airflow tasks to Hugging Face Datasets and
-Hub repositories. It supplies a shared ``HuggingFaceHook`` and three operators
-to load a dataset, map a Python callable, and publish a durable artifact. Data
+Hub repositories. It supplies a shared ``HuggingFaceHook`` and four operators
+to load a dataset, map a Python callable, stream a bounded sample, and publish a durable artifact. Data
 moves between tasks as Parquet objects and a small JSON manifest, so tasks can
 run on separate workers when their artifact store is shared.
 
@@ -16,11 +16,10 @@ default connection is absent.
 * Split aware Parquet handoff with features metadata and content fingerprints.
 * Synchronous dataset publication with the Hub commit SHA and URL in results.
 * ``hf://datasets/<repo_id>`` assets and OpenLineage conversion.
-* Optional dataset card generation and conservative README update policies.
 
-The v1 public operator API does not include streaming, filtering, or split
-assembly operators. Use Datasets streaming outside this handoff contract only
-when a future provider API explicitly supports its durable output semantics.
+Streaming is bounded by explicit source-row and output-row limits, then writes
+the selected rows through the same Parquet artifact contract. Standalone
+filtering and split assembly operators are not included in the v1 public API.
 
 Installation
 ------------

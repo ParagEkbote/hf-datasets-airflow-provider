@@ -20,8 +20,8 @@ from __future__ import annotations
 from typing import Any
 
 from datasets import load_dataset
-from huggingface_hub import HfApi, hf_hub_download
-from huggingface_hub.utils import EntryNotFoundError, RepositoryNotFoundError
+from huggingface_hub import HfApi
+from huggingface_hub.utils import RepositoryNotFoundError
 
 try:
     from airflow.sdk.bases.hook import BaseHook
@@ -100,18 +100,3 @@ class HuggingFaceHook(BaseHook):
         if token and "token" not in kwargs:
             kwargs["token"] = token
         return dataset.push_to_hub(repo_id, **kwargs)
-
-    def get_dataset_readme(self, repo_id: str) -> str | None:
-        try:
-            path = hf_hub_download(repo_id=repo_id, repo_type="dataset", filename="README.md", token=self.get_token())
-        except EntryNotFoundError:
-            return None
-        from pathlib import Path
-        return Path(path).read_text(encoding="utf-8")
-
-    def upload_dataset_readme(self, repo_id: str, content: str, commit_message: str) -> str | None:
-        result = self.get_conn().upload_file(
-            path_or_fileobj=content.encode("utf-8"), path_in_repo="README.md", repo_id=repo_id,
-            repo_type="dataset", commit_message=commit_message,
-        )
-        return getattr(result, "oid", None)

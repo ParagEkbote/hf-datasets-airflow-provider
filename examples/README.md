@@ -1,6 +1,6 @@
 # Provider-native example DAGs
 
-These examples use the initial public API for dataset loading, mapping, and Hub publication. Each example defines its map callable in the DAG module so it is available when the DAG is parsed and on workers.
+These examples use the public API for dataset loading, mapping, bounded streaming, and Hub publication. Each example defines its callable in the DAG module so it is available when the DAG is parsed and on workers.
 
 ## Prerequisites and configuration
 
@@ -45,7 +45,7 @@ the event-driven flow.
 
 * **GLUE MRPC:** `file:///tmp/hf-datasets/mrpc_normalized.json`, with `text` and `label`
   columns, followed by publication to the configured Hub repository.
-* **FineWeb-Edu:** a selected 1,000-row sample is cleaned and published.
+* **FineWeb-Edu:** up to 10,000 streamed rows are examined; up to 1,000 cleaned documents with at least 100 words are saved and published.
 * **SQuAD:** train and validation are mapped together and published as a DatasetDict.
 * **Daily refresh:** successful publication emits `hf://datasets/<HF_PRODUCER_REPO_ID>`.
   The consumer loads that Hub repository, maps it, and publishes its own result.
