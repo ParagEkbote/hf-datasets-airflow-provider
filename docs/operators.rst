@@ -24,15 +24,45 @@ LoadDatasetOperator
 (dataset configuration), ``split``, ``revision``, ``cache_dir``,
 ``download_mode`` and ``load_kwargs``. It persists the result and returns the
 artifact URI plus source ID, requested/resolved revision, configuration, split,
-row counts, and feature descriptions. Resolution of a source commit SHA is
-best-effort; pin a commit SHA in ``revision`` for reproducible inputs.
+row counts, and feature descriptions. For a Hub dataset, the operator resolves
+``revision`` (or the default branch) to a commit SHA before loading, loads that
+commit, and records it. The task fails if the revision cannot be resolved.
+Pin a commit SHA in ``revision`` for reproducible inputs across runs.
 
 The default ``reuse_dataset_if_exists`` mode reuses Datasets' valid cache.
 ``force_redownload`` forces a new download. ``cache_dir`` isolates cache data;
 it is separate from the output artifact destination. Keeping a stable cache
 directory allows retries and cleared task instances to reuse downloaded data.
 Run-specific cache directories are possible by templating ``cache_dir`` but are
-not the default.
+not the default. Datasets keys its cache on the resolved commit, so reusing it
+for the same commit returns the same data.
+
+Durable execution
+-----------------
+
+On Airflow 3.3 and later, ``LoadDatasetOperator`` and ``PushToHubOperator``
+keep what they did in the task state store, so a retry continues instead of
+starting over. ``durable`` is ``True`` by default. Set ``durable=False`` to
+turn it off. On earlier Airflow versions there is no task state store and
+``durable`` has no effect.
+
+* ``LoadDatasetOperator`` stores the commit it pinned. Every retry loads that
+  commit, even if ``main`` has moved on, so one Dag run never mixes two
+  versions of the source. A retry pins again if ``path`` or ``revision``
+  changed.
+* ``PushToHubOperator`` stores the commit SHA once the upload succeeds. If the
+  task fails after that, for example while uploading the dataset card, the
+  retry does not upload the data again. It emits the asset event with the
+  stored SHA. The stored commit is tied to the input's Datasets fingerprint,
+  which every operator records in its output, so different data is always
+  pushed. An input given as a plain URI has no fingerprint and is pushed again.
+
+Clearing a task from the UI or REST API discards its task state, so the task
+starts over: the load pins the current commit and the push uploads again.
+Clearing a whole Dag run, or running ``airflow tasks clear``, keeps task state
+(`apache/airflow#72929 <https://github.com/apache/airflow/issues/72929>`__).
+A load in a cleared run then reuses its pinned commit. A push uploads again
+whenever the upstream data changed.
 
 MapDatasetOperator
 ------------------

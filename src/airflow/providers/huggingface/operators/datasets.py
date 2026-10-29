@@ -1,3 +1,19 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 """Task operators for loading, transforming, and publishing datasets."""
 
 from __future__ import annotations
@@ -22,6 +38,11 @@ def _artifact_path(uri: str) -> Path:
     return Path(unquote(parsed.path))
 
 
+def _is_hub_repo_id(path: str) -> bool:
+    """Tell a Hub ``org/name`` repository from a local path, as ``load_dataset`` does."""
+    return path.count("/") == 1 and not path.startswith((".", "/")) and not Path(path).exists()
+
+
 def _reference_uri(reference: str | dict[str, Any]) -> str:
     """Accept a URI or the compact artifact reference returned by an operator."""
     if isinstance(reference, dict):
@@ -40,6 +61,9 @@ def _save(dataset: Any, uri: str) -> dict[str, Any]:
         "format": "arrow",
         "splits": {str(name): {"rows": len(part), "features": str(part.features)} for name, part in dataset.items()}
         if hasattr(dataset, "items") else {"dataset": {"rows": len(dataset), "features": str(dataset.features)}},
+        # Datasets' content fingerprint; a re-run that produces different data gets a different one.
+        "fingerprint": {str(name): part._fingerprint for name, part in dataset.items()}
+        if hasattr(dataset, "items") else dataset._fingerprint,
     }
 
 
@@ -62,32 +86,52 @@ class LoadDatasetOperator(BaseOperator):
 
     template_fields = ("path", "name", "split", "revision", "cache_dir", "output_uri")
 
+    _PINNED_REVISION_KEY = "pinned_revision"
+
     def __init__(self, *, path: str, output_uri: str, name: str | None = None, split: str | None = None,
                  revision: str | None = None, cache_dir: str | None = None,
                  download_mode: str = "reuse_dataset_if_exists", huggingface_conn_id: str | None = "huggingface_default",
-                 load_kwargs: dict[str, Any] | None = None, **kwargs: Any) -> None:
+                 load_kwargs: dict[str, Any] | None = None, durable: bool = True, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.path, self.output_uri, self.name, self.split = path, output_uri, name, split
         self.revision, self.cache_dir, self.download_mode = revision, cache_dir, download_mode
         self.huggingface_conn_id, self.load_kwargs = huggingface_conn_id, load_kwargs or {}
+        self.durable = durable
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+        hook = HuggingFaceDatasetsHook(self.huggingface_conn_id)
+        revision = self.revision
+        if _is_hub_repo_id(self.path):
+            revision = self._pin_revision(hook, context)
         kwargs = dict(self.load_kwargs)
         kwargs.update(download_mode=self.download_mode)
         if self.name is not None: kwargs["name"] = self.name
         if self.split is not None: kwargs["split"] = self.split
-        if self.revision is not None: kwargs["revision"] = self.revision
+        if revision is not None: kwargs["revision"] = revision
         if self.cache_dir is not None: kwargs["cache_dir"] = self.cache_dir
-        dataset = HuggingFaceDatasetsHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
+        dataset = hook.load_dataset(self.path, **kwargs)
         saved = _save(dataset, self.output_uri)
-        result = {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
-                  "revision": self.revision, "configuration": self.name, "split": self.split, **saved}
-        if "/" in self.path and not self.path.startswith(("/", "./", "../")):
-            try:
-                result["revision"] = HuggingFaceDatasetsHook(self.huggingface_conn_id).get_dataset_info(self.path, self.revision).sha
-            except Exception:
-                self.log.warning("Could not resolve source revision metadata; using the requested revision value.")
-        return result
+        return {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
+                "revision": revision, "configuration": self.name, "split": self.split, **saved}
+
+    def _pin_revision(self, hook: HuggingFaceDatasetsHook, context: dict[str, Any]) -> str:
+        """
+        Pin a moving ref such as ``main`` to its commit before loading.
+
+        The recorded revision is then the one that was loaded. With ``durable`` on Airflow 3.3+,
+        the commit is kept in the task state store, so every retry loads the commit the first
+        try pinned. Clearing the task from the UI or REST API discards task state, so the task
+        pins afresh; clearing the whole Dag run keeps it (apache/airflow#72929).
+        """
+        store = context.get("task_state_store") if self.durable else None
+        pinned = store.get(self._PINNED_REVISION_KEY) if store is not None else None
+        if pinned and pinned["path"] == self.path and pinned["requested"] == self.revision:
+            self.log.info("Loading commit %s of %s, pinned by an earlier try.", pinned["sha"], self.path)
+            return pinned["sha"]
+        sha = hook.get_dataset_info(self.path, self.revision).sha
+        if store is not None:
+            store.set(self._PINNED_REVISION_KEY, {"path": self.path, "requested": self.revision, "sha": sha})
+        return sha
 
 
 class MapDatasetOperator(BaseOperator):
@@ -214,8 +258,10 @@ class AssembleDatasetOperator(BaseOperator):
 class PushToHubOperator(BaseOperator):
     """Synchronously publish an artifact and emit a successful Airflow Asset event."""
 
-    template_fields = ("input_uri", "repo_id", "config", "commit_message", "card_template", "card_metadata", "card_description")
+    # repo_id is not templated: it defines the published Asset, which downstream Dags schedule on.
+    template_fields = ("input_uri", "config", "commit_message", "card_template", "card_metadata", "card_description")
 
+    _PUSHED_COMMIT_KEY = "pushed_commit"
     _CARD_START = "<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->"
     _CARD_END = "<!-- END AIRFLOW HUGGINGFACE DATASET CARD -->"
     _CARD_FIELDS = {"pretty_name": str, "license": str, "language": list, "task_categories": list,
@@ -226,7 +272,7 @@ class PushToHubOperator(BaseOperator):
                  huggingface_conn_id: str | None = "huggingface_default", push_kwargs: dict[str, Any] | None = None,
                  dataset_card: bool = False, card_template: str | None = None,
                  card_metadata: dict[str, Any] | None = None, card_description: str | None = None,
-                 card_update_policy: str = "preserve",
+                 card_update_policy: str = "preserve", durable: bool = True,
                  **kwargs: Any) -> None:
         if card_update_policy not in {"preserve", "update", "replace"}:
             raise ValueError("card_update_policy must be one of: 'preserve', 'update', or 'replace'.")
@@ -240,14 +286,19 @@ class PushToHubOperator(BaseOperator):
                 raise ValueError(f"Invalid dataset card metadata field or value: {key!r}.")
         if not dataset_card and card_update_policy != "preserve":
             raise ValueError("card_update_policy can be changed only when dataset_card=True.")
+        if "{{" in repo_id:
+            raise ValueError("repo_id cannot be templated: it defines the Asset that downstream Dags schedule on.")
         self.input_uri, self.repo_id, self.config = input_uri, repo_id, config
         self.private, self.commit_message = private, commit_message
         self.huggingface_conn_id, self.push_kwargs = huggingface_conn_id, push_kwargs or {}
         self.dataset_card, self.card_template = dataset_card, card_template
         self.card_metadata, self.card_description = card_metadata or {}, card_description
-        self.card_update_policy = card_update_policy
+        self.card_update_policy, self.durable = card_update_policy, durable
         self.published_asset = Asset(uri=f"huggingface://datasets/{repo_id}")
-        super().__init__(outlets=[self.published_asset], **kwargs)
+        outlets = kwargs.pop("outlets", None) or []
+        if not isinstance(outlets, (list, tuple)):
+            outlets = [outlets]
+        super().__init__(outlets=[*outlets, self.published_asset], **kwargs)
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
         dataset = _load_artifact(self.input_uri)
@@ -274,13 +325,25 @@ class PushToHubOperator(BaseOperator):
         if self.config is not None: kwargs["config_name"] = self.config
         if self.private is not None: kwargs["private"] = self.private
         if self.commit_message is not None: kwargs["commit_message"] = self.commit_message
-        result = hook.push_to_hub(dataset, self.repo_id, **kwargs)
-        commit_url = getattr(result, "url", None)
-        commit_sha = getattr(result, "oid", None)
-        if isinstance(result, str):
-            commit_url = result
-        if commit_url and not commit_sha:
-            commit_sha = commit_url.rstrip("/").rsplit("/", 1)[-1]
+        # With durable on Airflow 3.3+, a retry after a successful push (for example, when the card
+        # upload or the worker failed afterwards) reuses that commit instead of uploading again. The
+        # stored commit is tied to the input's fingerprint, so different data is always pushed.
+        store = context.get("task_state_store") if self.durable else None
+        fingerprint = self.input_uri.get("fingerprint") if isinstance(self.input_uri, dict) else None
+        pushed = store.get(self._PUSHED_COMMIT_KEY) if store is not None and fingerprint is not None else None
+        if pushed and pushed["repo_id"] == self.repo_id and pushed["fingerprint"] == fingerprint:
+            commit_sha = pushed["commit_sha"]
+            self.log.info("Commit %s was pushed to %s by an earlier try; not pushing again.", commit_sha, self.repo_id)
+        else:
+            result = hook.push_to_hub(dataset, self.repo_id, **kwargs)
+            commit_url = getattr(result, "url", None)
+            commit_sha = getattr(result, "oid", None)
+            if isinstance(result, str):
+                commit_url = result
+            if commit_url and not commit_sha:
+                commit_sha = commit_url.rstrip("/").rsplit("/", 1)[-1]
+            if store is not None and fingerprint is not None and commit_sha:
+                store.set(self._PUSHED_COMMIT_KEY, {"repo_id": self.repo_id, "fingerprint": fingerprint, "commit_sha": commit_sha})
         if card_text is not None:
             action = ("replaced" if self.card_update_policy == "replace" else "updated") if existing_readme is not None else "created"
             try:

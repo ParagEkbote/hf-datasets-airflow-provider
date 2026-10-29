@@ -1,5 +1,23 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+import pytest
 from datasets import Dataset, load_from_disk
 
+from airflow.sdk import Asset
 from airflow.providers.huggingface.operators.datasets import (
     LoadDatasetOperator,
     MapDatasetOperator,
@@ -18,7 +36,7 @@ def keep_even(example):
 def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
     from airflow.providers.huggingface.operators import datasets as operators
 
-    seen = {}
+    seen, calls = {}, []
     dataset = Dataset.from_dict({"text": ["a", "b"]})
 
     class FakeHook:
@@ -26,10 +44,12 @@ def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
             pass
 
         def load_dataset(self, path, **kwargs):
+            calls.append("load_dataset")
             seen.update(path=path, **kwargs)
             return dataset
 
         def get_dataset_info(self, path, revision):
+            calls.append(("get_dataset_info", revision))
             return type("Info", (), {"sha": "abc123"})()
 
     monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
@@ -42,7 +62,9 @@ def test_load_operator_persists_compact_reference(tmp_path, monkeypatch):
     result = operator.execute({})
 
     assert seen["download_mode"] == "reuse_dataset_if_exists"
-    assert seen["revision"] == "main"
+    # The requested ref is pinned to a commit first, and that commit is what gets loaded and recorded.
+    assert calls == [("get_dataset_info", "main"), "load_dataset"]
+    assert seen["revision"] == "abc123"
     assert result["revision"] == "abc123"
     assert result["uri"] == output
     assert result["splits"]["dataset"]["rows"] == 2
@@ -62,6 +84,9 @@ def test_load_operator_can_force_redownload(tmp_path, monkeypatch):
             seen.update(kwargs)
             return Dataset.from_dict({"value": [1]})
 
+        def get_dataset_info(self, path, revision):
+            return type("Info", (), {"sha": "abc123"})()
+
     monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
     operator = LoadDatasetOperator(
         task_id="load", path="org/data", output_uri=(tmp_path / "data").as_uri(),
@@ -71,6 +96,29 @@ def test_load_operator_can_force_redownload(tmp_path, monkeypatch):
     operator.execute({})
 
     assert seen["download_mode"] == "force_redownload"
+
+
+def test_load_operator_does_not_resolve_revision_for_local_path(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    class FakeHook:
+        def __init__(self, conn_id):
+            pass
+
+        def load_dataset(self, path, **kwargs):
+            return Dataset.from_dict({"value": [1]})
+
+        def get_dataset_info(self, path, revision):
+            raise AssertionError("a local path must not be looked up on the Hub")
+
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", FakeHook)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "local" / "data").mkdir(parents=True)
+    operator = LoadDatasetOperator(task_id="load", path="local/data", output_uri=(tmp_path / "out").as_uri())
+
+    result = operator.execute({})
+
+    assert result["revision"] is None
 
 
 def test_map_operator_maps_and_persists_arrow(tmp_path):
@@ -249,3 +297,160 @@ def test_preserve_existing_readme_and_validate_policy(tmp_path, monkeypatch):
         assert "card_update_policy" in str(exc)
     else:
         raise AssertionError("invalid card policy must fail during initialization")
+
+
+def test_push_keeps_user_outlets_alongside_hub_asset():
+    extra = Asset("s3://bucket/training-manifest")
+
+    operator = PushToHubOperator(task_id="publish", input_uri="file:///tmp/in", repo_id="org/data", outlets=[extra])
+
+    assert [asset.uri for asset in operator.outlets] == ["s3://bucket/training-manifest", "huggingface://datasets/org/data"]
+
+
+def test_push_rejects_templated_repo_id():
+    with pytest.raises(ValueError, match="repo_id cannot be templated"):
+        PushToHubOperator(task_id="publish", input_uri="file:///tmp/in", repo_id="{{ params.repo }}")
+
+
+class FakeTaskStateStore:
+    """Dict-backed stand-in for ``context["task_state_store"]`` (Airflow 3.3+)."""
+
+    def __init__(self):
+        self.values = {}
+
+    def get(self, key, default=None):
+        return self.values.get(key, default)
+
+    def set(self, key, value):
+        self.values[key] = value
+
+
+def _resolving_hook(resolved, sha="abc123"):
+    class FakeHook:
+        def __init__(self, conn_id):
+            pass
+
+        def load_dataset(self, path, **kwargs):
+            return Dataset.from_dict({"value": [1]})
+
+        def get_dataset_info(self, path, revision):
+            resolved.append(revision)
+            return type("Info", (), {"sha": sha})()
+
+    return FakeHook
+
+
+def test_durable_load_retry_reuses_commit_pinned_by_first_try(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    resolved, store = [], FakeTaskStateStore()
+    operator = LoadDatasetOperator(task_id="load", path="org/data", revision="main", output_uri=(tmp_path / "out").as_uri())
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", _resolving_hook(resolved, sha="first"))
+    operator.execute({"task_state_store": store})
+
+    # The branch moves on before the retry; the retry must still load the first try's commit.
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", _resolving_hook(resolved, sha="second"))
+    result = operator.execute({"task_state_store": store})
+
+    assert resolved == ["main"]
+    assert result["revision"] == "first"
+
+
+@pytest.mark.parametrize(
+    ("durable", "retry_revision", "expected"),
+    [
+        pytest.param(False, "main", "second", id="durable-disabled"),
+        pytest.param(True, "v2", "second", id="requested-revision-changed"),
+    ],
+)
+def test_load_resolves_again_when_pin_does_not_apply(tmp_path, monkeypatch, durable, retry_revision, expected):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    resolved, store = [], FakeTaskStateStore()
+    output = (tmp_path / "out").as_uri()
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", _resolving_hook(resolved, sha="first"))
+    LoadDatasetOperator(task_id="load", path="org/data", revision="main", output_uri=output, durable=durable).execute(
+        {"task_state_store": store}
+    )
+
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", _resolving_hook(resolved, sha="second"))
+    result = LoadDatasetOperator(
+        task_id="load", path="org/data", revision=retry_revision, output_uri=output, durable=durable
+    ).execute({"task_state_store": store})
+
+    assert result["revision"] == expected
+
+
+def _push_hook(pushes):
+    class FakeHook:
+        def __init__(self, conn_id):
+            pass
+
+        def push_to_hub(self, dataset, repo_id, **kwargs):
+            pushes.append(repo_id)
+            return type("Commit", (), {"oid": f"sha-{len(pushes)}"})()
+
+    return FakeHook
+
+
+def _outlet_events():
+    event = type("Event", (), {"extra": None})()
+
+    class OutletEvents:
+        def __getitem__(self, asset):
+            return event
+
+    return OutletEvents(), event
+
+
+def test_durable_push_retry_does_not_upload_again(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    source = tmp_path / "input"
+    dataset = Dataset.from_dict({"value": [1]})
+    dataset.save_to_disk(str(source))
+    reference = {"uri": source.as_uri(), "fingerprint": dataset._fingerprint}
+    pushes, store = [], FakeTaskStateStore()
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", _push_hook(pushes))
+    operator = PushToHubOperator(task_id="publish", input_uri=reference, repo_id="org/data")
+    operator.execute({"task_state_store": store})
+
+    outlet_events, event = _outlet_events()
+    result = operator.execute({"task_state_store": store, "outlet_events": outlet_events})
+
+    assert pushes == ["org/data"]
+    assert result["commit_sha"] == "sha-1"
+    assert event.extra["commit_sha"] == "sha-1"
+
+
+def test_durable_push_uploads_again_when_input_data_changed(tmp_path, monkeypatch):
+    from airflow.providers.huggingface.operators import datasets as operators
+
+    source = tmp_path / "input"
+    Dataset.from_dict({"value": [1]}).save_to_disk(str(source))
+    pushes, store = [], FakeTaskStateStore()
+    monkeypatch.setattr(operators, "HuggingFaceDatasetsHook", _push_hook(pushes))
+    PushToHubOperator(
+        task_id="publish", input_uri={"uri": source.as_uri(), "fingerprint": "before-fix"}, repo_id="org/data"
+    ).execute({"task_state_store": store})
+
+    # e.g. the whole Dag run was cleared after fixing the transform, which keeps task state.
+    result = PushToHubOperator(
+        task_id="publish", input_uri={"uri": source.as_uri(), "fingerprint": "after-fix"}, repo_id="org/data"
+    ).execute({"task_state_store": store})
+
+    assert pushes == ["org/data", "org/data"]
+    assert result["commit_sha"] == "sha-2"
+
+
+def test_saved_reference_carries_dataset_fingerprint(tmp_path):
+    source, output = tmp_path / "input", tmp_path / "output"
+    Dataset.from_dict({"value": [1, 2]}).save_to_disk(str(source))
+    operator = MapDatasetOperator(
+        task_id="map", input_uri=source.as_uri(), output_uri=output.as_uri(),
+        transform="tests.unit.test_operators:add_one",
+    )
+
+    reference = operator.execute({})
+
+    assert reference["fingerprint"] == load_from_disk(str(source)).map(add_one)._fingerprint
