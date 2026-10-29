@@ -1,29 +1,90 @@
-"""Task operators for loading, transforming, and publishing datasets."""
-
+"""Operators for loading, transforming, and publishing Hugging Face datasets."""
 from __future__ import annotations
 
-import importlib
-from pathlib import Path
+import hashlib
 import json
 import re
-from typing import Any
-from urllib.parse import unquote, urlparse
+from pathlib import Path
+from typing import Any, Callable
 
-from airflow.sdk import Asset
 from airflow.sdk.bases.operator import BaseOperator
+try:
+    from airflow.sdk import Asset
+except ImportError:
+    from airflow.datasets import Dataset as Asset
+try:
+    from airflow.sdk import ObjectStoragePath
+except ImportError:
+    try:
+        from airflow.io.path import ObjectStoragePath
+    except ImportError:
+        from airflow.providers.common.io.path import ObjectStoragePath
 
-from airflow.providers.huggingface.hooks.datasets import HuggingFaceDatasetsHook
+from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 
 
-def _artifact_path(uri: str) -> Path:
-    parsed = urlparse(uri)
-    if parsed.scheme != "file":
-        raise ValueError("MVP artifacts support file:// URIs only; workers must share the referenced filesystem.")
-    return Path(unquote(parsed.path))
+def _path(uri: str):
+    return ObjectStoragePath(uri)
 
 
-def _reference_uri(reference: str | dict[str, Any]) -> str:
-    """Accept a URI or the compact artifact reference returned by an operator."""
+def _sha256_path(uri: str) -> str:
+    digest = hashlib.sha256()
+    with _path(uri).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _splits(dataset: Any) -> dict[str, Any]:
+    return dict(dataset.items()) if hasattr(dataset, "items") else {"dataset": dataset}
+
+
+def _validate_feature(feature: Any, column: str) -> None:
+    """Reject feature encodings whose semantics are not guaranteed by Parquet."""
+    if isinstance(feature, dict):
+        for key, value in feature.items():
+            _validate_feature(value, f"{column}.{key}")
+        return
+    if isinstance(feature, (list, tuple)):
+        for value in feature:
+            _validate_feature(value, column)
+        return
+    kind = type(feature).__name__
+    if kind not in {"Value", "ClassLabel", "Sequence", "LargeList", "Features"}:
+        raise ValueError(f"Feature {column!r} uses unsupported Parquet feature type {kind!r}")
+    if kind in {"Sequence", "LargeList"}:
+        child = getattr(feature, "feature", None)
+        if child is not None:
+            _validate_feature(child, column)
+
+
+def _save(dataset: Any, uri: str, provenance: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Persist each split as Parquet and a JSON manifest at ``uri``."""
+    manifest = {"format": "parquet", "version": 1, "splits": {}, "provenance": provenance or {}}
+    base = _path(uri)
+    for index, (name, part) in enumerate(_splits(dataset).items()):
+        for column, feature in part.features.items():
+            _validate_feature(feature, column)
+        data_uri = f"{uri}.split-{index}.parquet"
+        _path(data_uri).parent.mkdir(parents=True, exist_ok=True)
+        with _path(data_uri).open("wb") as stream:
+            part.to_parquet(stream)
+        manifest["splits"][str(name)] = {
+            "uri": data_uri,
+            "sha256": _sha256_path(data_uri),
+            "rows": len(part),
+            "features": part.features.to_dict(),
+        }
+    encoded = json.dumps(manifest, separators=(",", ":")).encode()
+    base.parent.mkdir(parents=True, exist_ok=True)
+    with base.open("wb") as stream:
+        stream.write(encoded)
+    return {"uri": uri, "format": "parquet", "fingerprint": hashlib.sha256(encoded).hexdigest(),
+            "splits": {name: {"rows": part["rows"], "features": str(part["features"])}
+                       for name, part in manifest["splits"].items()}}
+
+
+def _reference(reference: str | dict[str, Any]) -> str:
     if isinstance(reference, dict):
         if "uri" not in reference:
             raise ValueError("Artifact reference must contain a 'uri' field.")
@@ -31,39 +92,36 @@ def _reference_uri(reference: str | dict[str, Any]) -> str:
     return reference
 
 
-def _save(dataset: Any, uri: str) -> dict[str, Any]:
-    path = _artifact_path(uri)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    dataset.save_to_disk(str(path))
-    return {
-        "uri": uri,
-        "format": "arrow",
-        "splits": {str(name): {"rows": len(part), "features": str(part.features)} for name, part in dataset.items()}
-        if hasattr(dataset, "items") else {"dataset": {"rows": len(dataset), "features": str(dataset.features)}},
-    }
-
-
 def _load_artifact(reference: str | dict[str, Any]) -> Any:
-    uri = _reference_uri(reference)
-    path = _artifact_path(uri)
-    try:
-        from datasets import load_from_disk, load_dataset
-    except ImportError as exc:
-        raise ImportError("Install the provider dependencies to load dataset artifacts.") from exc
-    if path.is_dir():
-        return load_from_disk(str(path))
-    if path.suffix.lower() == ".parquet":
-        return load_dataset("parquet", data_files=str(path))
-    raise ValueError(f"Artifact must be a Datasets save_to_disk directory or Parquet file: {uri}")
+    from datasets import Dataset, DatasetDict, DatasetInfo, Features
+    import pyarrow.parquet as parquet
+    uri = _reference(reference)
+    with _path(uri).open("rb") as stream:
+        manifest_bytes = stream.read()
+    manifest = json.loads(manifest_bytes)
+    if isinstance(reference, dict) and reference.get("fingerprint"):
+        actual = hashlib.sha256(manifest_bytes).hexdigest()
+        if actual != reference["fingerprint"]:
+            raise ValueError("Dataset artifact fingerprint does not match its reference")
+    if manifest.get("format") != "parquet" or manifest.get("version") != 1:
+        raise ValueError(f"Unsupported dataset artifact manifest: {uri}")
+    parts = {}
+    for name, item in manifest["splits"].items():
+        if _sha256_path(item["uri"]) != item.get("sha256"):
+            raise ValueError(f"Dataset artifact split fingerprint mismatch: {item['uri']}")
+        with _path(item["uri"]).open("rb") as stream:
+            table = parquet.read_table(stream)
+        features = Features.from_dict(item["features"])
+        parts[name] = Dataset(table, info=DatasetInfo(features=features))
+    return parts["dataset"] if list(parts) == ["dataset"] else DatasetDict(parts)
 
 
 class LoadDatasetOperator(BaseOperator):
-    """Load a Hub or local dataset and persist it as an Arrow artifact."""
-
+    """Load a dataset and persist it as a durable Parquet artifact."""
     template_fields = ("path", "name", "split", "revision", "cache_dir", "output_uri")
 
-    def __init__(self, *, path: str, output_uri: str, name: str | None = None, split: str | None = None,
-                 revision: str | None = None, cache_dir: str | None = None,
+    def __init__(self, *, path: str, output_uri: str, name: str | None = None,
+                 split: str | None = None, revision: str | None = None, cache_dir: str | None = None,
                  download_mode: str = "reuse_dataset_if_exists", huggingface_conn_id: str | None = "huggingface_default",
                  load_kwargs: dict[str, Any] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
@@ -72,148 +130,44 @@ class LoadDatasetOperator(BaseOperator):
         self.huggingface_conn_id, self.load_kwargs = huggingface_conn_id, load_kwargs or {}
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        kwargs = dict(self.load_kwargs)
-        kwargs.update(download_mode=self.download_mode)
-        if self.name is not None: kwargs["name"] = self.name
-        if self.split is not None: kwargs["split"] = self.split
-        if self.revision is not None: kwargs["revision"] = self.revision
-        if self.cache_dir is not None: kwargs["cache_dir"] = self.cache_dir
-        dataset = HuggingFaceDatasetsHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
-        saved = _save(dataset, self.output_uri)
-        result = {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
-                  "revision": self.revision, "configuration": self.name, "split": self.split, **saved}
+        kwargs = dict(self.load_kwargs, download_mode=self.download_mode)
+        for key, value in (("name", self.name), ("split", self.split), ("revision", self.revision), ("cache_dir", self.cache_dir)):
+            if value is not None:
+                kwargs[key] = value
+        hook = HuggingFaceHook(self.huggingface_conn_id)
+        revision = self.revision
         if "/" in self.path and not self.path.startswith(("/", "./", "../")):
-            try:
-                result["revision"] = HuggingFaceDatasetsHook(self.huggingface_conn_id).get_dataset_info(self.path, self.revision).sha
-            except Exception:
-                self.log.warning("Could not resolve source revision metadata; using the requested revision value.")
-        return result
+            revision = hook.get_dataset_info(self.path, self.revision).sha
+            kwargs["revision"] = revision
+        dataset = hook.load_dataset(self.path, **kwargs)
+        provenance = {"repository_id": self.path, "revision": revision, "configuration": self.name, "split": self.split}
+        result = _save(dataset, self.output_uri, provenance)
+        return {**result, **provenance}
 
 
 class MapDatasetOperator(BaseOperator):
-    """Apply an importable callable inside the worker and persist the result."""
+    """Apply a Python callable and persist the result as a Parquet artifact."""
+    template_fields = ("input_uri", "output_uri", "transform_kwargs")
 
-    template_fields = ("input_uri", "output_uri", "transform", "transform_kwargs")
-
-    def __init__(self, *, input_uri: str | dict[str, Any], output_uri: str, transform: str,
-                 transform_kwargs: dict[str, Any] | None = None, map_kwargs: dict[str, Any] | None = None,
-                 **kwargs: Any) -> None:
+    def __init__(self, *, input_uri: str | dict[str, Any], output_uri: str,
+                 transform: Callable[..., Any], transform_kwargs: dict[str, Any] | None = None,
+                 map_kwargs: dict[str, Any] | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        if not callable(transform):
+            raise TypeError("transform must be a callable")
         self.input_uri, self.output_uri, self.transform = input_uri, output_uri, transform
         self.transform_kwargs, self.map_kwargs = transform_kwargs or {}, map_kwargs or {}
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        if ":" not in self.transform:
-            raise ValueError("transform must use the import path 'package.module:function'")
-        module_name, function_name = self.transform.split(":", 1)
-        function = getattr(importlib.import_module(module_name), function_name)
         dataset = _load_artifact(self.input_uri)
-        mapped = dataset.map(function, fn_kwargs=self.transform_kwargs, **self.map_kwargs)
-        saved = _save(mapped, self.output_uri)
-        source_ref = self.input_uri if isinstance(self.input_uri, dict) else {}
-        provenance = {key: source_ref[key] for key in ("repository_id", "revision", "configuration", "split") if key in source_ref}
-        return {"uri": self.output_uri, "format": "arrow", "source_uri": _reference_uri(self.input_uri), **provenance, **saved}
-
-
-class FilterDatasetOperator(BaseOperator):
-    """Filter a persisted dataset using Datasets' supported filter semantics."""
-
-    template_fields = ("input_uri", "output_uri", "predicate")
-
-    def __init__(self, *, input_uri: str | dict[str, Any], output_uri: str,
-                 predicate: str, filter_kwargs: dict[str, Any] | None = None, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self.input_uri, self.output_uri, self.predicate = input_uri, output_uri, predicate
-        self.filter_kwargs = filter_kwargs or {}
-
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        if ":" not in self.predicate:
-            raise ValueError("predicate must use the import path 'package.module:function'")
-        module_name, function_name = self.predicate.split(":", 1)
-        function = getattr(importlib.import_module(module_name), function_name)
-        dataset = _load_artifact(self.input_uri)
-        filtered = dataset.filter(function, **self.filter_kwargs)
-        saved = _save(filtered, self.output_uri)
-        return {"uri": self.output_uri, "format": "arrow", "source_uri": _reference_uri(self.input_uri), **saved}
-
-
-class StreamDatasetOperator(BaseOperator):
-    """Read a bounded streaming sample, transform/filter it, and persist Arrow."""
-
-    template_fields = ("path", "name", "split", "revision", "output_uri", "transform", "predicate")
-
-    def __init__(self, *, path: str, output_uri: str, max_source_rows: int, max_output_rows: int,
-                 transform: str, name: str | None = None, split: str | None = None,
-                 revision: str | None = None, predicate: str | None = None,
-                 transform_kwargs: dict[str, Any] | None = None,
-                 feature_types: dict[str, str] | None = None,
-                 huggingface_conn_id: str | None = "huggingface_default", **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        if max_source_rows <= 0 or max_output_rows <= 0:
-            raise ValueError("Streaming row bounds must be positive")
-        self.path, self.output_uri = path, output_uri
-        self.max_source_rows, self.max_output_rows = max_source_rows, max_output_rows
-        self.transform, self.predicate = transform, predicate
-        self.name, self.split, self.revision = name, split, revision
-        self.transform_kwargs, self.feature_types = transform_kwargs or {}, feature_types or {}
-        self.huggingface_conn_id = huggingface_conn_id
-
-    @staticmethod
-    def _callable(spec: str):
-        if ":" not in spec:
-            raise ValueError("callable must use the import path 'package.module:function'")
-        module, name = spec.split(":", 1)
-        return getattr(importlib.import_module(module), name)
-
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        from datasets import Dataset, Features, Value
-        kwargs = {"streaming": True}
-        if self.name is not None: kwargs["name"] = self.name
-        if self.split is not None: kwargs["split"] = self.split
-        if self.revision is not None: kwargs["revision"] = self.revision
-        stream = HuggingFaceDatasetsHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
-        transform = self._callable(self.transform)
-        predicate = self._callable(self.predicate) if self.predicate else None
-        rows, examined = [], 0
-        for row in stream:
-            if examined >= self.max_source_rows or len(rows) >= self.max_output_rows:
-                break
-            examined += 1
-            result = transform(row, **self.transform_kwargs)
-            if predicate is None or predicate(result):
-                rows.append(result)
-        if not rows:
-            raise ValueError("No streaming rows passed the configured bounds and filter")
-        features = Features({key: Value(kind) for key, kind in self.feature_types.items()}) if self.feature_types else None
-        dataset = Dataset.from_list(rows, features=features)
-        saved = _save(dataset, self.output_uri)
-        return {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
-                "revision": self.revision, "configuration": self.name, "split": self.split,
-                "streaming": True, "source_rows_examined": examined, **saved}
-
-
-class AssembleDatasetOperator(BaseOperator):
-    """Assemble named persisted split artifacts into a DatasetDict artifact."""
-
-    template_fields = ("inputs", "output_uri")
-
-    def __init__(self, *, inputs: dict[str, str | dict[str, Any]], output_uri: str, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        if not inputs:
-            raise ValueError("inputs must contain at least one named split artifact")
-        self.inputs, self.output_uri = inputs, output_uri
-
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        from datasets import DatasetDict
-        parts = {name: _load_artifact(reference) for name, reference in self.inputs.items()}
-        assembled = DatasetDict(parts)
-        saved = _save(assembled, self.output_uri)
-        return {"uri": self.output_uri, "format": "arrow", "splits": list(parts), **saved}
+        mapped = dataset.map(self.transform, fn_kwargs=self.transform_kwargs, **self.map_kwargs)
+        source = self.input_uri if isinstance(self.input_uri, dict) else {}
+        provenance = {k: source[k] for k in ("repository_id", "revision", "configuration", "split") if k in source}
+        return {**_save(mapped, self.output_uri, provenance), "source_uri": _reference(self.input_uri), **provenance}
 
 
 class PushToHubOperator(BaseOperator):
-    """Synchronously publish an artifact and emit a successful Airflow Asset event."""
-
+    """Publish a Parquet artifact and emit its canonical dataset asset."""
     template_fields = ("input_uri", "repo_id", "config", "commit_message", "card_template", "card_metadata", "card_description")
 
     _CARD_START = "<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->"
@@ -223,11 +177,11 @@ class PushToHubOperator(BaseOperator):
 
     def __init__(self, *, input_uri: str | dict[str, Any], repo_id: str, config: str | None = None,
                  private: bool | None = None, commit_message: str | None = None,
-                 huggingface_conn_id: str | None = "huggingface_default", push_kwargs: dict[str, Any] | None = None,
+                 huggingface_conn_id: str | None = "huggingface_default",
+                 push_kwargs: dict[str, Any] | None = None,
                  dataset_card: bool = False, card_template: str | None = None,
                  card_metadata: dict[str, Any] | None = None, card_description: str | None = None,
-                 card_update_policy: str = "preserve",
-                 **kwargs: Any) -> None:
+                 card_update_policy: str = "preserve", **kwargs: Any) -> None:
         if card_update_policy not in {"preserve", "update", "replace"}:
             raise ValueError("card_update_policy must be one of: 'preserve', 'update', or 'replace'.")
         if not isinstance(dataset_card, bool):
@@ -246,64 +200,73 @@ class PushToHubOperator(BaseOperator):
         self.dataset_card, self.card_template = dataset_card, card_template
         self.card_metadata, self.card_description = card_metadata or {}, card_description
         self.card_update_policy = card_update_policy
-        self.published_asset = Asset(uri=f"huggingface://datasets/{repo_id}")
+        self.published_asset = Asset(uri=f"hf://datasets/{repo_id}")
         super().__init__(outlets=[self.published_asset], **kwargs)
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
         dataset = _load_artifact(self.input_uri)
-        hook = HuggingFaceDatasetsHook(self.huggingface_conn_id)
+        source_ref = self.input_uri if isinstance(self.input_uri, dict) else {}
+        if not source_ref.get("fingerprint"):
+            raise ValueError("Publication requires an artifact reference with a fingerprint")
+        fingerprint = source_ref["fingerprint"]
+        state = context.get("task_state_store")
+        state_key = f"huggingface-publication:{self.repo_id}:{fingerprint}" if fingerprint else None
+        if state is not None and state_key:
+            prior = state.get(state_key)
+            if prior:
+                self._emit_asset_event(context, prior)
+                return prior
+        hook = HuggingFaceHook(self.huggingface_conn_id)
         card_result = {"enabled": False, "action": "disabled"}
-        existing_readme = None
-        if self.dataset_card:
-            existing_readme = hook.get_dataset_readme(self.repo_id)
-            if existing_readme is not None and self.card_update_policy == "preserve":
-                card_result = {"enabled": True, "action": "preserved", "path": "README.md"}
+        existing_readme = hook.get_dataset_readme(self.repo_id) if self.dataset_card else None
         card_text = None
-        if self.dataset_card and card_result["action"] != "preserved":
+        if self.dataset_card and existing_readme is not None and self.card_update_policy == "preserve":
+            card_result = {"enabled": True, "action": "preserved", "path": "README.md"}
+        elif self.dataset_card:
             card_text = self._render_card(dataset)
             if existing_readme is not None and self.card_update_policy == "update":
                 pattern = re.compile(re.escape(self._CARD_START) + r".*?" + re.escape(self._CARD_END), re.S)
                 if not pattern.search(existing_readme):
                     raise ValueError("Cannot safely update existing README.md: provider-managed card markers are missing. Add the markers or use card_update_policy='replace'.")
                 card_text = pattern.sub(lambda _: card_text.strip(), existing_readme)
-            elif existing_readme is not None and self.card_update_policy == "replace":
-                pass
-            elif existing_readme is not None:
-                raise ValueError("Existing README.md would be overwritten; select preserve, update, or explicit replace policy.")
-        kwargs = dict(self.push_kwargs)
-        if self.config is not None: kwargs["config_name"] = self.config
-        if self.private is not None: kwargs["private"] = self.private
-        if self.commit_message is not None: kwargs["commit_message"] = self.commit_message
-        result = hook.push_to_hub(dataset, self.repo_id, **kwargs)
-        commit_url = getattr(result, "url", None)
-        commit_sha = getattr(result, "oid", None)
-        if isinstance(result, str):
-            commit_url = result
-        if commit_url and not commit_sha:
-            commit_sha = commit_url.rstrip("/").rsplit("/", 1)[-1]
+        prior = hook.find_publication_commit(self.repo_id, fingerprint)
+        if prior is not None:
+            result = prior
+        else:
+            kwargs = dict(self.push_kwargs)
+            if self.config is not None: kwargs["config_name"] = self.config
+            if self.private is not None: kwargs["private"] = self.private
+            marker = f"airflow-artifact-sha256:{fingerprint}"
+            message = self.commit_message or "Publish dataset from Airflow"
+            kwargs["commit_message"] = f"{message} [{marker}]"
+            result = hook.push_to_hub(dataset, self.repo_id, **kwargs)
         if card_text is not None:
             action = ("replaced" if self.card_update_policy == "replace" else "updated") if existing_readme is not None else "created"
-            try:
-                card_commit = hook.upload_dataset_readme(self.repo_id, card_text, commit_message="Update dataset card")
-            except Exception as exc:
-                raise RuntimeError(f"Dataset was published to {self.repo_id!r} (commit {commit_sha or 'unknown'}), but README.md publication failed: {exc}") from exc
+            card_commit = hook.upload_dataset_readme(self.repo_id, card_text, commit_message="Update dataset card")
             card_result = {"enabled": True, "action": action, "path": "README.md"}
             if card_commit:
                 card_result["commit_sha"] = card_commit
-        output = {"repository_id": self.repo_id, "commit_sha": commit_sha,
-                  "url": f"https://huggingface.co/datasets/{self.repo_id}"}
-        output["dataset_card"] = card_result
-        outlet_events = context.get("outlet_events")
-        if outlet_events is not None:
-            outlet_events[self.published_asset].extra = {"repository_id": self.repo_id, "commit_sha": commit_sha}
-        source_ref = self.input_uri if isinstance(self.input_uri, dict) else {}
-        output["source_repository_id"] = source_ref.get("repository_id")
-        output["source_revision"] = source_ref.get("revision")
+        output = {"repository_id": self.repo_id, "commit_sha": result.oid,
+                  "commit_url": result.commit_url, "url": f"https://huggingface.co/datasets/{self.repo_id}",
+                  "fingerprint": fingerprint, "source_repository_id": source_ref.get("repository_id"),
+                  "source_revision": source_ref.get("revision"), "dataset_card": card_result}
+        if state is not None and state_key:
+            state.set(state_key, output)
+        self._emit_asset_event(context, output)
         return output
+
+    def _emit_asset_event(self, context: dict[str, Any], publication: dict[str, Any]) -> None:
+        events = context.get("outlet_events")
+        if events is not None:
+            events[self.published_asset].extra = {
+                "repository_id": self.repo_id,
+                "commit_sha": publication["commit_sha"],
+                "commit_url": publication["commit_url"],
+                "fingerprint": publication["fingerprint"],
+            }
 
     def _render_card(self, dataset: Any) -> str:
         metadata = dict(self.card_metadata)
-        description = self.card_description
         structure = {}
         parts = dataset.items() if hasattr(dataset, "items") else [("dataset", dataset)]
         for name, part in parts:
@@ -311,27 +274,25 @@ class PushToHubOperator(BaseOperator):
         source = self.input_uri if isinstance(self.input_uri, dict) else {}
         provenance = {key: source[key] for key in ("repository_id", "revision", "configuration", "split") if source.get(key) is not None}
         if self.card_template:
-            path = Path(self.card_template)
             try:
-                template_text = path.read_text(encoding="utf-8")
+                template_text = Path(self.card_template).read_text(encoding="utf-8")
             except OSError as exc:
-                raise ValueError(f"Unable to read dataset card template {str(path)!r}: {exc}") from exc
-            try:
-                from jinja2 import Environment, StrictUndefined
-            except ImportError as exc:
-                raise ImportError("Custom dataset card templates require Jinja2.") from exc
-            body = Environment(undefined=StrictUndefined, autoescape=False).from_string(template_text).render(
-                repo_id=self.repo_id, metadata=metadata, description=description, structure=structure, provenance=provenance)
-            return body
+                raise ValueError(f"Unable to read dataset card template {self.card_template!r}: {exc}") from exc
+            from jinja2 import Environment, StrictUndefined
+            return Environment(undefined=StrictUndefined, autoescape=False).from_string(template_text).render(
+                repo_id=self.repo_id, metadata=metadata, description=self.card_description,
+                structure=structure, provenance=provenance)
         yaml = "\n".join(f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in metadata.items())
-        sections = ["---", yaml, "---", "", f"{self._CARD_START}", "# Dataset Description", "",
-                    description or f"Dataset published to `{self.repo_id}`."]
+        sections = ["---", yaml, "---", "", self._CARD_START, "# Dataset Description", "",
+                    self.card_description or f"Dataset published to `{self.repo_id}`."]
         if provenance:
             sections += ["", "## Source and Provenance", ""]
             sections += [f"- **{key.replace('_', ' ').title()}:** {value}" for key, value in provenance.items()]
         sections += ["", "## Dataset Structure", "", "| Split | Rows | Features |", "|---|---:|---|"]
-        sections += [f"| {name} | {info['rows']} | {', '.join(f'{k}: {v}' for k, v in info['features'].items())} |" for name, info in structure.items()]
+        sections += [f"| {name} | {info['rows']} | {', '.join(f'{k}: {v}' for k, v in info['features'].items())} |"
+                     for name, info in structure.items()]
         if self.config:
-            sections += ["", "## Usage", "", "```python", "from datasets import load_dataset", f'dataset = load_dataset("{self.repo_id}", "{self.config}")', "```"]
+            sections += ["", "## Usage", "", "```python", "from datasets import load_dataset",
+                         f'dataset = load_dataset("{self.repo_id}", "{self.config}")', "```"]
         sections += [self._CARD_END, ""]
         return "\n".join(sections)

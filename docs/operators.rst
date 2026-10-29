@@ -1,180 +1,108 @@
 Operators
 =========
 
-Artifact references
--------------------
-
-Operators exchange small JSON references through XCom. An Arrow artifact
-reference has the form ``{"uri": "file:///mnt/data/name", "format": "arrow",
-"repository_id": "org/data", "revision": "<commit-sha>"}``; the provenance
-fields are included when available. Pass the upstream task's whole output (for
-example, ``input_uri=load.output``) to preserve this metadata, or pass its URI
-when metadata is not needed.
-The URI points to a directory written by Datasets ``save_to_disk``. Workers
-executing consecutive tasks must see the same filesystem at that path. A local
-path on one ephemeral worker is not shared storage; configure a mounted shared
-volume in multi-worker deployments. This MVP does not configure cloud storage.
-Mapping also accepts a ``file://`` URI to a Parquet file and reads it through
-Datasets' Parquet builder.
+The initial public operator API is ``LoadDatasetOperator``,
+``MapDatasetOperator``, and ``PushToHubOperator``. The operators exchange the
+manifest and split Parquet objects described in :doc:`artifacts`.
 
 LoadDatasetOperator
 -------------------
 
-``LoadDatasetOperator`` accepts ``path``, ``output_uri``, optional ``name``
-(dataset configuration), ``split``, ``revision``, ``cache_dir``,
-``download_mode`` and ``load_kwargs``. It persists the result and returns the
-artifact URI plus source ID, requested/resolved revision, configuration, split,
-row counts, and feature descriptions. Resolution of a source commit SHA is
-best-effort; pin a commit SHA in ``revision`` for reproducible inputs.
+Required parameters:
 
-The default ``reuse_dataset_if_exists`` mode reuses Datasets' valid cache.
-``force_redownload`` forces a new download. ``cache_dir`` isolates cache data;
-it is separate from the output artifact destination. Keeping a stable cache
-directory allows retries and cleared task instances to reuse downloaded data.
-Run-specific cache directories are possible by templating ``cache_dir`` but are
-not the default.
+* ``path``: Datasets source, commonly a Hub dataset repository ID.
+* ``output_uri``: ObjectStoragePath URI where the manifest will be written.
+
+Optional parameters:
+
+* ``name`` and ``split``: Datasets configuration and split.
+* ``revision``: source branch, tag, or commit SHA.
+* ``cache_dir`` and ``download_mode``: Datasets cache controls.
+* ``huggingface_conn_id``: connection ID, defaulting to
+  ``huggingface_default``.
+* ``load_kwargs``: additional keyword arguments passed to
+  ``datasets.load_dataset``.
+
+For a Hub repository, the operator resolves ``revision`` through Hub metadata,
+then passes the resolved commit SHA to ``load_dataset``. The result reference
+records that SHA with the artifact fingerprint, source ID, configuration, and
+split. A load or revision lookup error is propagated and no artifact reference
+is returned.
 
 MapDatasetOperator
 ------------------
 
-``MapDatasetOperator`` accepts ``input_uri``, ``output_uri``, an import path in
-``module:function`` form, optional ``transform_kwargs``, and ``map_kwargs``.
-The callable is imported only in task execution, never during DAG parsing.
-``map_kwargs`` are passed to ``Dataset.map``/``DatasetDict.map`` and include
-options such as ``batched``, ``batch_size``, ``num_proc``, and
-``load_from_cache_file``. Datasets retains split structure and Arrow features
-where the transformation output permits it.
+Required parameters are ``input_uri``, ``output_uri``, and ``transform``.
+``transform`` must be a Python callable available when the DAG is parsed and
+when the task worker executes. The operator does not template or import the
+callable from a string. ``transform_kwargs`` are passed as Datasets ``fn_kwargs``;
+``map_kwargs`` are passed to ``Dataset.map`` or ``DatasetDict.map``. The output
+preserves compatible provenance and records a new artifact fingerprint.
 
-FilterDatasetOperator
----------------------
+PushToHubOperator
+-----------------
 
-``FilterDatasetOperator`` accepts an importable ``predicate`` in
-``module:function`` form and passes it to ``Dataset.filter`` (or
-``DatasetDict.filter``). Predicates return a boolean for each record, so row
-selection uses Datasets filtering semantics rather than dropping rows inside a
-mapping function.
+Required parameters are ``input_uri`` (the full artifact reference, including
+fingerprint) and ``repo_id``. ``config``, ``private``, ``commit_message``,
+``huggingface_conn_id``, and ``push_kwargs`` configure publication. The
+operator verifies the manifest fingerprint and per-split checksums before
+uploading. It returns ``repository_id``, the Hub ``CommitInfo.oid`` as
+``commit_sha``, ``CommitInfo.commit_url`` as ``commit_url``, the artifact
+fingerprint, and source provenance. Hub exceptions propagate without wrapping.
 
-StreamDatasetOperator
----------------------
+The commit message includes an artifact fingerprint marker. Airflow 3.3 and
+later task state store support caches the result when that facility is
+available. The marker also lets a retry find a successfully created data commit
+if the worker exited before saving task state. The task emits an asset event
+with the same commit SHA and URL only after successful publication (including
+optional card handling).
 
-``StreamDatasetOperator`` owns bounded iterable loading and persistence. It
-accepts source limits, an importable row transform, an optional row predicate,
-and an explicit output ``feature_types`` schema (for example ``string`` and
-``int64``). It persists an Arrow artifact and returns its compact reference;
-the stream and row objects never enter XCom.
+Optional card parameters retain the existing README behavior:
 
-AssembleDatasetOperator
------------------------
+* ``dataset_card`` enables a generated ``README.md``; default ``False``.
+* ``card_metadata`` accepts ``pretty_name`` and ``license`` strings, and
+  ``language``, ``task_categories``, ``tags``, and ``size_categories`` lists
+  of strings.
+* ``card_description`` supplies human-authored description text.
+* ``card_template`` selects a trusted local Jinja2 template. Install Jinja2
+  when using it. Its context is ``repo_id``, ``metadata``, ``description``,
+  ``structure``, and ``provenance``.
+* ``card_update_policy`` is ``preserve`` (default), ``update`` (replace only
+  provider marked content), or ``replace`` (replace the whole README).
 
-``AssembleDatasetOperator`` accepts a mapping of split names to artifact
-references and persists a ``DatasetDict``. Split artifacts must all be visible
-to the executing worker under the same documented shared-storage contract.
+A card upload is a separate Hub commit. If it fails, the task fails and emits
+no event, while retry recovery prevents the dataset data commit from being
+created again. Connection and Hub errors retain their original exception types.
 
-PushToHubOperator and assets
-----------------------------
+Streaming decision
+------------------
 
-``PushToHubOperator`` accepts the artifact URI, target ``repo_id``, optional
-``config``, ``private``, ``commit_message`` and ``push_kwargs``. It uploads
-synchronously and returns repository ID, URL, and commit SHA when the Datasets
-API provides one. A successful task emits an Airflow 3 Asset event with the
-repository ID and commit SHA in event metadata. The stable asset URI is
-``huggingface://datasets/<repo_id>``; use the same ``Asset`` in a downstream
-DAG's schedule. A failed upload raises and emits no successful event.
+Streaming, standalone filtering, and split assembly operators are not part of
+the initial v1 API. A streaming ``IterableDataset`` cannot be written through
+the current materialized Parquet handoff without changing memory and failure
+semantics. Use a separately designed streaming-to-durable-artifact workflow
+when one is needed; this release does not claim streaming support.
 
-Dataset cards
-~~~~~~~~~~~~~
-
-Card generation is disabled by default. Set ``dataset_card=True`` to generate
-a root ``README.md``. ``card_metadata`` accepts the Hub fields ``pretty_name``
-and ``license`` (strings), plus ``language``, ``task_categories``, ``tags`` and
-``size_categories`` (lists of strings). The operator validates these types and
-does not infer licensing or other descriptive metadata. ``card_description``
-is human-authored text. The built-in card records the destination, observed
-split names, row counts and feature types, along with source ID, revision,
-configuration and split when present in the input artifact reference.
-
-``card_template`` may name a trusted Jinja template file. Its context contains
-only ``repo_id``, ``metadata``, ``description``, ``structure`` and ``provenance``;
-Jinja2 must be installed. Strict undefined-variable handling makes template
-mistakes fail before dataset publication.
-
-``card_update_policy`` defaults to ``preserve``: an existing README is left
-alone, while a missing README is created. ``update`` replaces only a region
-bracketed by ``<!-- BEGIN AIRFLOW HUGGINGFACE DATASET CARD -->`` and
-``<!-- END AIRFLOW HUGGINGFACE DATASET CARD -->``; it fails if those markers
-are absent. ``replace`` explicitly replaces the whole README. Use it only when
-you intend to discard existing documentation. With cards disabled, no README
-is inspected or changed.
-
-Dataset and card commits are separate Hub operations and are not atomic. If
-the dataset upload succeeds and README upload fails, the task fails with the
-dataset commit (when available) in its error. A retry using ``preserve`` will
-not overwrite a README that appeared in the meantime. XCom reports the card
-action and separate card commit when the Hub returns one; it never includes
-README contents. The configured Hugging Face connection must have permission
-to create or update repository files. Missing source provenance is simply
-omitted.
-
-Example with card generation disabled (the default):
+Example
+-------
 
 .. code-block:: python
 
    from airflow.providers.huggingface.operators.datasets import (
        LoadDatasetOperator, MapDatasetOperator, PushToHubOperator,
    )
+   from my_project.transforms import normalize
 
    load = LoadDatasetOperator(
        task_id="load", path="nyu-mll/glue", name="mrpc", split="train",
-       output_uri="file:///mnt/shared/mrpc",
+       revision="<commit-sha>", output_uri="s3://airflow/data/mrpc.json",
    )
    transform = MapDatasetOperator(
-       task_id="normalize_pairs", input_uri=load.output,
-       output_uri="file:///mnt/shared/mrpc_normalized",
-       transform="examples.transforms:normalize_glue_pair",
-       map_kwargs={"remove_columns": ["sentence1", "sentence2", "idx"]},
+       task_id="normalize", input_uri=load.output,
+       output_uri="s3://airflow/data/mrpc-normalized.json", transform=normalize,
    )
    publish = PushToHubOperator(
        task_id="publish", input_uri=transform.output,
-       repo_id="my-org/mrpc-normalized", dataset_card=False,
+       repo_id="my-org/mrpc-normalized",
    )
    load >> transform >> publish
-
-Example generating a card while preserving a README already in the repository:
-
-.. code-block:: python
-
-   from airflow.providers.huggingface.operators.datasets import (
-       LoadDatasetOperator, MapDatasetOperator, PushToHubOperator,
-   )
-
-   load = LoadDatasetOperator(
-       task_id="load", path="nyu-mll/glue", name="mrpc", split="train",
-       output_uri="file:///mnt/shared/mrpc",
-   )
-   transform = MapDatasetOperator(
-       task_id="normalize_pairs", input_uri=load.output,
-       output_uri="file:///mnt/shared/mrpc_normalized",
-       transform="examples.transforms:normalize_glue_pair",
-       map_kwargs={"remove_columns": ["sentence1", "sentence2", "idx"]},
-   )
-   publish = PushToHubOperator(
-       task_id="publish", input_uri=transform.output,
-       repo_id="my-org/mrpc-normalized", dataset_card=True,
-       card_description="MRPC sentence pairs normalized into a single text field while retaining the similarity label.",
-       card_metadata={"pretty_name": "Normalized MRPC training pairs", "tags": ["glue", "mrpc", "text-classification"]},
-       card_update_policy="preserve",
-   )
-   load >> transform >> publish
-
-Uploads and transformations run in the task worker. Large datasets require
-adequate worker memory, temporary disk, and network bandwidth. Arrow artifacts
-are the native persisted format; Parquet is accepted as map input for
-interoperability, but is not the internal handoff format.
-
-Examples
---------
-
-The provider-native DAGs are documented in ``examples/README.md``. They cover
-GLUE normalization, bounded FineWeb streaming, parallel SQuAD split processing
-and assembly, and a producer-consumer Asset workflow. All source revisions
-should be configured as commit SHAs before execution.

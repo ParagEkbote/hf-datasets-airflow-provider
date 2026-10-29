@@ -9,8 +9,8 @@ Use-case
 MRPC (Microsoft Research Paraphrase Corpus) ships two sentence columns and
 a binary similarity label.  Fine-tuning encoders on it typically needs a
 single fused text field.  This DAG shows the canonical load → map →
-publish path using in-memory ``Dataset`` objects (no streaming) for a
-dataset small enough to fit in worker memory.
+publish path using durable Parquet artifacts for
+a dataset small enough to fit in worker memory.
 
 Prerequisites
 ~~~~~~~~~~~~~
@@ -25,9 +25,6 @@ Prerequisites
   local tutorial paths use ``/tmp/hf-datasets``; change them for a shared mount
   in a multi-worker deployment.
 
-* Create a module ``examples.transforms`` importable on every task worker
-  (or adjust the ``transform`` argument below).  The normalize function is
-  reproduced in a comment at the bottom of this file.
 
 Airflow 3 Asset scheduling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -36,7 +33,6 @@ declares ``schedule=[published]`` will be triggered automatically after a
 successful run of the ``publish`` task.
 """
 
-from datetime import datetime
 import os
 
 from airflow.sdk import DAG, Asset
@@ -46,15 +42,21 @@ from airflow.providers.huggingface.operators.datasets import (
     PushToHubOperator,
 )
 
+def normalize_glue_pair(batch):
+    """Fuse MRPC sentence pairs while retaining their labels."""
+    return {
+        "text": [f"{' '.join(a.split()).lower()} [SEP] {' '.join(b.split()).lower()}"
+                 for a, b in zip(batch["sentence1"], batch["sentence2"])],
+        "label": batch["label"],
+    }
+
+
 # Stable Asset URI that downstream DAGs can schedule on.
-MRPC_REPO_ID = os.environ.get("HF_MRPC_REPO_ID", "AINovice2005/glue-mrpc-normalized")
-published = Asset(f"huggingface://datasets/{MRPC_REPO_ID}")
+MRPC_REPO_ID = os.environ.get("HF_MRPC_REPO_ID", "my-org/glue-mrpc-normalized")
+published = Asset(f"hf://datasets/{MRPC_REPO_ID}")
 
 with DAG(
     dag_id="glue_mrpc_normalize",
-    start_date=datetime(2024, 1, 1),
-    schedule=None,
-    catchup=False,
     tags=["huggingface", "glue", "example"],
 ) as dag:
 
@@ -64,7 +66,7 @@ with DAG(
         name="mrpc",          # dataset configuration
         split="train",
         revision="bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
-        output_uri="file:///tmp/hf-datasets/mrpc_raw",
+        output_uri="file:///tmp/hf-datasets/mrpc_raw.json",
         # cache_dir keeps downloaded Arrow files across retries.
         cache_dir="/tmp/hf-datasets/cache",
     )
@@ -73,9 +75,8 @@ with DAG(
         task_id="normalize_pairs",
         # Pass the whole XCom artifact reference so provenance is forwarded.
         input_uri=load.output,
-        output_uri="file:///tmp/hf-datasets/mrpc_normalized",
-        # Dotted import path: module:callable
-        transform="examples.transforms:normalize_glue_pair",
+        output_uri="file:///tmp/hf-datasets/mrpc_normalized.json",
+        transform=normalize_glue_pair,
         map_kwargs={
             # Combine both sentences in a single pass and drop the raw columns.
             "batched": True,
@@ -90,20 +91,6 @@ with DAG(
         repo_id=MRPC_REPO_ID,
         private=True,
         commit_message="Airflow: normalized MRPC training split",
-        # Generate a dataset card, preserving any README already present.
-        dataset_card=True,
-        card_description=(
-            "MRPC sentence pairs fused into a single ``text`` field while "
-            "retaining the binary similarity label.  Produced by the "
-            "``glue_mrpc_normalize`` Airflow DAG."
-        ),
-        card_metadata={
-            "pretty_name": "Normalized MRPC training pairs",
-            "license": "mit",
-            "task_categories": ["text-classification"],
-            "tags": ["glue", "mrpc", "paraphrase"],
-        },
-        card_update_policy="preserve",
     )
 
     load >> transform >> publish

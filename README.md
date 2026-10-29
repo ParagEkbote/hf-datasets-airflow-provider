@@ -17,23 +17,23 @@ The root [`providers.yaml`](providers.yaml) records the provider inventory; runt
 ## End-to-end DAG
 
 ```python
-from datetime import datetime
 from airflow.sdk import DAG, Asset
+from my_project.transforms import normalize
 from airflow.providers.huggingface.operators.datasets import (
     LoadDatasetOperator, MapDatasetOperator, PushToHubOperator,
 )
 
-published = Asset("huggingface://datasets/my-org/processed-demo")
+published = Asset("hf://datasets/my-org/processed-demo")
 
-with DAG("hf_dataset_pipeline", start_date=datetime(2024, 1, 1), schedule=None, catchup=False) as dag:
+with DAG("hf_dataset_pipeline") as dag:
     load = LoadDatasetOperator(
         task_id="load", path="stanfordnlp/imdb", split="train",
-        revision="main", output_uri="file:///mnt/datasets/imdb",
+        revision="<commit-sha>", output_uri="file:///mnt/datasets/imdb.json",
     )
     transform = MapDatasetOperator(
         task_id="transform", input_uri=load.output,
-        output_uri="file:///mnt/datasets/imdb_processed",
-        transform="my_project.transforms:normalize", map_kwargs={"batched": True, "num_proc": 2},
+        output_uri="file:///mnt/datasets/imdb_processed.json",
+        transform=normalize, map_kwargs={"batched": True, "num_proc": 2},
     )
     publish = PushToHubOperator(
         task_id="publish", input_uri=transform.output,
@@ -48,4 +48,4 @@ with DAG("hf_dataset_pipeline", start_date=datetime(2024, 1, 1), schedule=None, 
 
 ## Examples
 
-The [`examples/`](examples/) directory contains a GLUE MRPC DAG that loads a small map-style dataset into memory and normalizes sentence pairs, plus a FineWeb-Edu DAG that streams a large corpus, lazily cleans and filters documents, and persists a bounded 1,000-row sample. See [example notes](docs/operators.rst#examples).
+The [`examples/`](examples/) directory contains DAG examples for loading, mapping, and publishing datasets. See [example notes](docs/operators.rst#examples).

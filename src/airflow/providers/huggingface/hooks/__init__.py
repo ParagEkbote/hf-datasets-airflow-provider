@@ -1,2 +1,4 @@
+"""Hugging Face provider hooks."""
+from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 
-"""Hooks for Hugging Face services."""
+__all__ = ["HuggingFaceHook"]

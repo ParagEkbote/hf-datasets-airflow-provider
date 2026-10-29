@@ -7,23 +7,23 @@ def get_provider_info() -> dict:
         "name": "Hugging Face",
         "description": "Load, transform, and publish Hugging Face Datasets.",
         "versions": ["0.1.0"],
-        "integrations": [
-            {"integration-name": "Hugging Face Datasets", "external-doc-url": "https://huggingface.co/docs/datasets/"}
-        ],
-        "hooks": [
-            {
-                "integration-name": "Hugging Face Datasets",
-                "python-modules": ["airflow.providers.huggingface.hooks.datasets"],
-            }
-        ],
-        "connection-types": [
-            {
-                "connection-type": "huggingface",
-                "hook-class-name": "airflow.providers.huggingface.hooks.datasets.HuggingFaceDatasetsHook",
-                "hook-name": "Hugging Face",
-            }
-        ],
-        "operators": [
-            {"integration-name": "Hugging Face Datasets", "python-modules": ["airflow.providers.huggingface.operators.datasets"]}
-        ],
+        "integrations": [{"integration-name": "Hugging Face Datasets", "external-doc-url": "https://huggingface.co/docs/datasets/"}],
+        "hooks": [{"integration-name": "Hugging Face", "python-modules": ["airflow.providers.huggingface.hooks.huggingface"]}],
+        "connection-types": [{
+            "connection-type": "huggingface",
+            "hook-class-name": "airflow.providers.huggingface.hooks.huggingface.HuggingFaceHook",
+            "hook-name": "Hugging Face",
+            "conn-fields": {},
+            "ui-field-behaviour": {
+                "hidden-fields": ["host", "schema", "port", "login"],
+                "relabeling": {"password": "Access token"},
+            },
+        }],
+        "operators": [{"integration-name": "Hugging Face Datasets", "python-modules": ["airflow.providers.huggingface.operators.datasets"]}],
+        "asset-uris": [{
+            "schemes": ["hf"],
+            "factory": "airflow.providers.huggingface.asset.create_asset",
+            "handler": "airflow.providers.huggingface.asset.sanitize_uri",
+            "to_openlineage_converter": "airflow.providers.huggingface.asset.to_openlineage_dataset",
+        }],
     }
