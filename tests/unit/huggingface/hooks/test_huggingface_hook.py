@@ -3,7 +3,7 @@ from unittest.mock import patch
 
 import pytest
 from airflow.exceptions import AirflowNotFoundException
-from airflow.hooks.base import BaseHook
+from airflow.sdk.bases.hook import BaseHook
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 

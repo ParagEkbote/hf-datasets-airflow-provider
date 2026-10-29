@@ -115,13 +115,13 @@ class LoadDatasetOperator(BaseOperator):
         if self.split is not None: kwargs["split"] = self.split
         if self.revision is not None: kwargs["revision"] = self.revision
         if self.cache_dir is not None: kwargs["cache_dir"] = self.cache_dir
-        dataset = HuggingFaceDatasetsHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
+        dataset = HuggingFaceHook(self.huggingface_conn_id).load_dataset(self.path, **kwargs)
         saved = _save(dataset, self.output_uri)
         result = {"uri": self.output_uri, "format": "arrow", "repository_id": self.path,
                   "revision": self.revision, "configuration": self.name, "split": self.split, **saved}
         if "/" in self.path and not self.path.startswith(("/", "./", "../")):
             try:
-                result["revision"] = HuggingFaceDatasetsHook(self.huggingface_conn_id).get_dataset_info(self.path, self.revision).sha
+                result["revision"] = HuggingFaceHook(self.huggingface_conn_id).get_dataset_info(self.path, self.revision).sha
             except Exception:
                 self.log.warning("Could not resolve source revision metadata; using the requested revision value.")
         return result
