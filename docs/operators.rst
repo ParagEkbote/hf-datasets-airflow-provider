@@ -8,26 +8,19 @@ manifest and split Parquet objects described in :doc:`artifacts`.
 LoadDatasetOperator
 -------------------
 
-Required parameters:
+``LoadDatasetOperator`` accepts ``path``, ``output_uri``, optional ``name``
+(dataset configuration), ``split``, ``revision``, ``cache_dir``,
+``download_mode`` and ``load_kwargs``. It persists the result and returns the
+artifact URI plus source ID, requested/resolved revision, configuration, split,
+row counts, and feature descriptions. Resolution of a source commit SHA is
+best-effort; pin a commit SHA in ``revision`` for reproducible inputs.
 
-* ``path``: Datasets source, commonly a Hub dataset repository ID.
-* ``output_uri``: ObjectStoragePath URI where the manifest will be written.
-
-Optional parameters:
-
-* ``name`` and ``split``: Datasets configuration and split.
-* ``revision``: source branch, tag, or commit SHA.
-* ``cache_dir`` and ``download_mode``: Datasets cache controls.
-* ``huggingface_conn_id``: connection ID, defaulting to
-  ``huggingface_default``.
-* ``load_kwargs``: additional keyword arguments passed to
-  ``datasets.load_dataset``.
-
-For a Hub repository, the operator resolves ``revision`` through Hub metadata,
-then passes the resolved commit SHA to ``load_dataset``. The result reference
-records that SHA with the artifact fingerprint, source ID, configuration, and
-split. A load or revision lookup error is propagated and no artifact reference
-is returned.
+The default ``reuse_dataset_if_exists`` mode reuses Datasets' valid cache.
+``force_redownload`` forces a new download. ``cache_dir`` isolates cache data;
+it is separate from the output artifact destination. Keeping a stable cache
+directory allows retries and cleared task instances to reuse downloaded data.
+Run-specific cache directories are possible by templating ``cache_dir`` but are
+not the default.
 
 MapDatasetOperator
 ------------------
