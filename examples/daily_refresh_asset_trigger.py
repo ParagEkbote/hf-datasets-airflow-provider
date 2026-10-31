@@ -14,61 +14,42 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Publish a daily refreshed dataset and trigger a separate consumer by Asset."""
-
-from datetime import datetime
-
+"""Publish a refreshed dataset and schedule a consumer from its asset."""
 from airflow.sdk import Asset, DAG
-from airflow.providers.huggingface.operators.datasets import (
-    FilterDatasetOperator, LoadDatasetOperator, MapDatasetOperator, PushToHubOperator,
-)
+import os
+from airflow.providers.huggingface.operators.datasets import LoadDatasetOperator, MapDatasetOperator, PushToHubOperator
 
 SOURCE_REPO = "tatsu-lab/alpaca"
-PRODUCER_REPO = "AINovice2005/alpaca-long-output"
-CONSUMER_REPO = "AINovice2005/alpaca-long-output-consumed"
-PUBLISHED = Asset(f"huggingface://datasets/{PRODUCER_REPO}")
+PRODUCER_REPO = os.environ.get("HF_PRODUCER_REPO_ID", "my-org/alpaca-long-output")
+CONSUMER_REPO = os.environ.get("HF_CONSUMER_REPO_ID", "my-org/alpaca-long-output-consumed")
+PUBLISHED = Asset(f"hf://datasets/{PRODUCER_REPO}")
 
-with DAG(
-    dag_id="huggingface_daily_refresh_producer", start_date=datetime(2024, 1, 1),
-    schedule="@daily", catchup=False, tags=["huggingface", "assets", "example"],
-    doc_md="Load and enrich the pinned Alpaca source, filter long outputs, then publish. Publication emits the Asset only on success.",
-) as producer:
-    load = LoadDatasetOperator(
-        task_id="load_source", path=SOURCE_REPO, split="train",
-        revision="dce01c9b08f87459cf36a430d809084718273017", output_uri="file:///tmp/hf-datasets/alpaca/source",
-    )
-    enrich = MapDatasetOperator(
-        task_id="add_character_count", input_uri=load.output,
-        output_uri="file:///tmp/hf-datasets/alpaca/enriched",
-        transform="examples.transforms:add_char_count", map_kwargs={"batched": True},
-    )
-    long_outputs = FilterDatasetOperator(
-        task_id="filter_long_outputs", input_uri=enrich.output,
-        output_uri="file:///tmp/hf-datasets/alpaca/long_outputs",
-        predicate="examples.transforms:keep_long_outputs",
-    )
-    publish = PushToHubOperator(
-        task_id="publish", input_uri=long_outputs.output, repo_id=PRODUCER_REPO,
-        private=True, commit_message="Airflow daily refresh: long Alpaca outputs",
-    )
-    load >> enrich >> long_outputs >> publish
+def add_char_count(batch):
+    """Add a count from instruction, input, and output text."""
+    inputs = batch.get("input", [""] * len(batch["instruction"]))
+    batch["char_count"] = [len(a) + len(b) + len(c) for a, b, c in zip(batch["instruction"], inputs, batch["output"])]
+    return batch
 
-with DAG(
-    dag_id="huggingface_daily_refresh_consumer", start_date=datetime(2024, 1, 1),
-    schedule=[PUBLISHED], catchup=False, tags=["huggingface", "assets", "example"],
-    doc_md="Load the producer's published Hub dataset after its Asset event and add consumer metadata.",
-) as consumer:
-    consume = LoadDatasetOperator(
-        task_id="load_published_dataset", path=PRODUCER_REPO, split="train",
-        output_uri="file:///tmp/hf-datasets/alpaca/consumer_input",
-    )
-    remap = MapDatasetOperator(
-        task_id="refresh_character_count", input_uri=consume.output,
-        output_uri="file:///tmp/hf-datasets/alpaca/consumer_output",
-        transform="examples.transforms:add_char_count", map_kwargs={"batched": True},
-    )
-    republish = PushToHubOperator(
-        task_id="publish_consumer_output", input_uri=remap.output, repo_id=CONSUMER_REPO,
-        private=True, commit_message="Airflow Asset consumer refresh",
-    )
-    consume >> remap >> republish
+
+with DAG("huggingface_daily_refresh_producer", schedule="@daily", tags=["huggingface", "assets", "example"]) as producer:
+    load = LoadDatasetOperator(task_id="load_source", path=SOURCE_REPO, split="train",
+        revision="dce01c9b08f87459cf36a430d809084718273017",
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/source.json")
+    enrich = MapDatasetOperator(task_id="add_character_count", input_uri=load.output,
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/enriched.json", transform=add_char_count,
+        map_kwargs={"batched": True})
+    publish = PushToHubOperator(task_id="publish", input_uri=enrich.output,
+        repo_id=PRODUCER_REPO, private=True)
+    load >> enrich >> publish
+
+with DAG("huggingface_daily_refresh_consumer", schedule=[PUBLISHED], tags=["huggingface", "assets", "example"]) as consumer:
+    load = LoadDatasetOperator(task_id="load_published_dataset", path=PRODUCER_REPO, split="train",
+        # Pin the load to the commit carried by the event that triggered this run.
+        revision="{{ (triggering_asset_events.values() | first | first).extra['commit_sha'] }}",
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/consumer_input.json")
+    remap = MapDatasetOperator(task_id="refresh_character_count", input_uri=load.output,
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/consumer_output.json", transform=add_char_count,
+        map_kwargs={"batched": True})
+    publish = PushToHubOperator(task_id="publish_consumer_output", input_uri=remap.output,
+        repo_id=CONSUMER_REPO, private=True)
+    load >> remap >> publish
