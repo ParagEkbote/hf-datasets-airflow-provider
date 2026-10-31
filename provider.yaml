@@ -1,13 +1,16 @@
 package-name: apache-airflow-providers-huggingface
 name: Hugging Face
 description: Load, transform, and publish Hugging Face Datasets.
+state: ready
+source-date-epoch: 0
+lifecycle: incubation
 versions:
   - 0.1.0
 integrations:
   - integration-name: Hugging Face Datasets
     external-doc-url: https://huggingface.co/docs/datasets/
 hooks:
-  - integration-name: Hugging Face
+  - integration-name: Hugging Face Datasets
     python-modules:
       - airflow.providers.huggingface.hooks.huggingface
 operators:
