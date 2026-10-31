@@ -38,25 +38,25 @@ Prerequisites
   ``huggingface`` and a write-access token in the password field.
 
 * Ensure the example artifact directory is visible to all task workers. The
-  local tutorial paths use ``/tmp/hf-datasets``; change them for a shared mount
-  in a multi-worker deployment.
+  local tutorial paths use ``/tmp/hf-datasets/<dag_id>/<run_id>``; change the
+  base path for a shared mount in a multi-worker deployment.
 
 
 Airflow 3 Asset scheduling
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
-``published`` is registered as an ``Asset``.  Any downstream DAG that
-declares ``schedule=[published]`` will be triggered automatically after a
-successful run of the ``publish`` task.
+``PushToHubOperator`` emits an asset for its Hub repository after successful
+publication. A downstream DAG can schedule on ``Asset("hf://datasets/<repo>")``.
 """
 
 import os
 
-from airflow.sdk import DAG, Asset
+from airflow.sdk import DAG
 from airflow.providers.huggingface.operators.datasets import (
     LoadDatasetOperator,
     MapDatasetOperator,
     PushToHubOperator,
 )
+
 
 def normalize_glue_pair(batch):
     """Fuse MRPC sentence pairs while retaining their labels."""
@@ -67,9 +67,7 @@ def normalize_glue_pair(batch):
     }
 
 
-# Stable Asset URI that downstream DAGs can schedule on.
 MRPC_REPO_ID = os.environ.get("HF_MRPC_REPO_ID", "my-org/glue-mrpc-normalized")
-published = Asset(f"hf://datasets/{MRPC_REPO_ID}")
 
 with DAG(
     dag_id="glue_mrpc_normalize",
@@ -82,7 +80,7 @@ with DAG(
         name="mrpc",          # dataset configuration
         split="train",
         revision="bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c",
-        output_uri="file:///tmp/hf-datasets/mrpc_raw.json",
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/mrpc_raw.json",
         # cache_dir keeps downloaded Arrow files across retries.
         cache_dir="/tmp/hf-datasets/cache",
     )
@@ -91,7 +89,7 @@ with DAG(
         task_id="normalize_pairs",
         # Pass the whole XCom artifact reference so provenance is forwarded.
         input_uri=load.output,
-        output_uri="file:///tmp/hf-datasets/mrpc_normalized.json",
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/mrpc_normalized.json",
         transform=normalize_glue_pair,
         map_kwargs={
             # Combine both sentences in a single pass and drop the raw columns.

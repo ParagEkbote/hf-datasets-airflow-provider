@@ -40,12 +40,12 @@ with DAG(dag_id="huggingface_squad_multi_split_pipeline", tags=["huggingface", "
         task_id="load_splits",
         path="rajpurkar/squad",
         revision="7b6d24c440a36b6815f21b70d25016731768db1f",
-        output_uri="file:///tmp/hf-datasets/squad/source.json",
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/squad/source.json",
     )
     transform = MapDatasetOperator(
         task_id="flatten_splits",
         input_uri=load.output,
-        output_uri="file:///tmp/hf-datasets/squad/flattened.json",
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/squad/flattened.json",
         transform=flatten_squad_example,
         map_kwargs={"remove_columns": ["id", "title", "context", "question", "answers"]},
     )

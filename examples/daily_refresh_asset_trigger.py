@@ -34,9 +34,9 @@ def add_char_count(batch):
 with DAG("huggingface_daily_refresh_producer", schedule="@daily", tags=["huggingface", "assets", "example"]) as producer:
     load = LoadDatasetOperator(task_id="load_source", path=SOURCE_REPO, split="train",
         revision="dce01c9b08f87459cf36a430d809084718273017",
-        output_uri="file:///tmp/hf-datasets/alpaca/source.json")
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/source.json")
     enrich = MapDatasetOperator(task_id="add_character_count", input_uri=load.output,
-        output_uri="file:///tmp/hf-datasets/alpaca/enriched.json", transform=add_char_count,
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/enriched.json", transform=add_char_count,
         map_kwargs={"batched": True})
     publish = PushToHubOperator(task_id="publish", input_uri=enrich.output,
         repo_id=PRODUCER_REPO, private=True)
@@ -44,9 +44,9 @@ with DAG("huggingface_daily_refresh_producer", schedule="@daily", tags=["hugging
 
 with DAG("huggingface_daily_refresh_consumer", schedule=[PUBLISHED], tags=["huggingface", "assets", "example"]) as consumer:
     load = LoadDatasetOperator(task_id="load_published_dataset", path=PRODUCER_REPO, split="train",
-        output_uri="file:///tmp/hf-datasets/alpaca/consumer_input.json")
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/consumer_input.json")
     remap = MapDatasetOperator(task_id="refresh_character_count", input_uri=load.output,
-        output_uri="file:///tmp/hf-datasets/alpaca/consumer_output.json", transform=add_char_count,
+        output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/consumer_output.json", transform=add_char_count,
         map_kwargs={"batched": True})
     publish = PushToHubOperator(task_id="publish_consumer_output", input_uri=remap.output,
         repo_id=CONSUMER_REPO, private=True)
