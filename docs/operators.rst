@@ -71,6 +71,40 @@ identifies the source and target for this DAG run. A retry searches the target
 branch or pull request refs and accepts only a final upload commit; intermediate
 parts of a multi-commit upload do not count as completed publication.
 
+Execution proceeds in this order:
+
+#. **Pin the source.** For a Hub dataset, the operator resolves the requested
+   revision to a commit SHA. With ``durable=True``, it stores that SHA in the
+   task state store under a key for the source path, requested revision,
+   configuration, and split. A retry reuses the SHA, so a moving branch such as
+   ``main`` does not silently change between attempts. Non-Hub paths are passed
+   to Datasets without Hub revision lookup.
+#. **Check for a completed publication.** The operator builds a marker from
+   the task and run IDs, source and pinned revision, configuration and split,
+   destination repository, target config/revision, and pull-request setting.
+   With durability enabled, it first checks task state, then searches the target
+   Hub refs for a completed commit carrying that marker. A match skips loading
+   the source and pushing again; the prior result and asset event are reused.
+#. **Create a lazy stream if recovery found no commit.** The operator calls
+   ``load_dataset(..., streaming=True)`` and passes the optional configuration,
+   split, and pinned revision. Hugging Face Datasets reads rows incrementally.
+   The optional ``transform`` is applied with ``IterableDataset.map`` and
+   ``transform_kwargs``; the optional ``predicate`` is then applied with
+   ``IterableDataset.filter``. Neither operation materializes the entire
+   dataset first.
+#. **Publish directly to the Hub.** The transformed iterable is passed to
+   ``push_to_hub`` in the same task. ``config``, ``private``, and ``push_kwargs``
+   control the destination. The commit message includes the recovery marker.
+   Datasets uploads Parquet shards progressively; the operator does not collect
+   the rows into a list or write an intermediate artifact.
+#. **Recover and report the commit.** If the push returns a commit, its SHA and
+   URL are returned. If it returns no commit object and durability is enabled,
+   the operator searches the Hub again in case the upload succeeded before the
+   worker stopped. It accepts only a final upload part. If no completed commit
+   can be found, the task raises ``RuntimeError``. The result contains commit
+   metadata and source provenance, not dataset rows; that result is saved to
+   task state when available and copied to the outlet event's extra fields.
+
 Unlike the local Parquet artifact path, this operator delegates feature
 serialization to Datasets' Hub upload implementation and does not use the
 provider's ``_validate_feature`` whitelist. It does not create a local manifest
