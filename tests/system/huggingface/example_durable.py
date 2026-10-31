@@ -21,7 +21,7 @@ import airflow
 import pytest
 from packaging.version import Version
 from airflow.sdk import DAG, task
-from airflow.task.trigger_rule import TriggerRule
+from airflow.providers.common.compat.sdk import TriggerRule
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 from airflow.providers.huggingface.operators.datasets import (
@@ -93,15 +93,16 @@ with DAG(dag_id="huggingface_system_durable", tags=["huggingface", "system-test"
     @task
     def verify_single_data_commit(mapped_ref, publication):
         fingerprint = mapped_ref["fingerprint"]
-        marker = f"airflow-artifact-sha256:{fingerprint}"
+        marker_prefix = f"airflow-artifact-sha256:{fingerprint}:target:"
         commits = HuggingFaceHook(CONN_ID).get_conn().list_repo_commits(REPO_ID, repo_type="dataset")
         matches = [
             commit
             for commit in commits
-            if marker in (getattr(commit, "message", None) or getattr(commit, "commit_message", ""))
+            if marker_prefix in (getattr(commit, "title", "") or "")
+            and HuggingFaceHook._commit_is_complete(commit)
         ]
         assert len(matches) == 1
-        assert publication["commit_sha"] == matches[0].oid
+        assert publication["commit_sha"] == matches[0].commit_id
 
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def delete_private_repo(created_repo):

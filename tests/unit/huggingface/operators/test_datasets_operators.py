@@ -27,6 +27,7 @@ from airflow.providers.huggingface.operators.datasets import (
     MapDatasetOperator,
     PushToHubOperator,
     StreamDatasetOperator,
+    _publication_marker,
     _load_artifact,
     _save,
 )
@@ -175,6 +176,13 @@ def test_parquet_manifest_preserves_order_features_and_dataset_splits(tmp_path):
     assert reference["splits"]["train"]["rows"] == 1
 
 
+def test_single_dataset_split_name_survives_artifact_round_trip(tmp_path):
+    source = Dataset.from_dict({"value": [1]}, split="validation")
+    reference = _save(source, (tmp_path / "single-split.json").as_uri())
+    restored = _load_artifact(reference)
+    assert restored.split == "validation"
+
+
 def test_parquet_rejects_media_feature_types(tmp_path):
     dataset = Dataset.from_dict({"image": [None]}, features=Features({"image": Image()}))
     with pytest.raises(ValueError, match="unsupported Parquet feature type"):
@@ -234,7 +242,9 @@ def test_push_returns_commit_info_and_emits_matching_asset_event(tmp_path, hub_d
     push_to_hub.assert_called_once()
     kwargs = push_to_hub.call_args.kwargs
     assert reference["fingerprint"] in kwargs["commit_message"]
-    hf_api.return_value.list_repo_commits.assert_called_once_with("org/data", repo_type="dataset")
+    hf_api.return_value.list_repo_commits.assert_called_once_with(
+        "org/data", repo_type="dataset", revision="main"
+    )
     assert result["commit_sha"] == commit.oid
     assert result["commit_url"] == commit.commit_url
     assert event.extra["commit_sha"] == result["commit_sha"]
@@ -263,7 +273,7 @@ def test_push_requires_reference_and_validates_fingerprint(tmp_path):
     with pytest.raises(ValueError, match="requires an artifact reference"):
         operator.execute({})
     reference["fingerprint"] = "bad"
-    operator = PushToHubOperator(task_id="publish_bad", input_uri=reference, repo_id="org/data")
+    operator = PushToHubOperator(task_id="publish_bad", input_uri=reference, repo_id="org/data", durable=False)
     with pytest.raises(ValueError, match="artifact fingerprint"):
         operator.execute({})
 
@@ -271,8 +281,11 @@ def test_push_requires_reference_and_validates_fingerprint(tmp_path):
 def test_airflow_30_path_without_state_store_and_retry_with_store(tmp_path, hub_dependencies):
     hf_api, _ = hub_dependencies
     reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "input.json").as_uri())
-    marker = f"airflow-artifact-sha256:{reference['fingerprint']}"
-    commit = commit_info(oid="a" * 40, message=f"Publish [{marker}]")
+    target_marker = _publication_marker(
+        "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
+    )
+    marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
+    commit = SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}]", message="")
     hf_api.return_value.list_repo_commits.return_value = [commit]
     operator = PushToHubOperator(task_id="legacy", input_uri=reference, repo_id="org/data",
                                  huggingface_conn_id="huggingface_test")
@@ -285,6 +298,30 @@ def test_airflow_30_path_without_state_store_and_retry_with_store(tmp_path, hub_
         def __getitem__(self, asset): return event
     assert operator.execute({"task_state_store": store, "outlet_events": Events()}) == result
     assert event.extra["commit_sha"] == result["commit_sha"]
+
+
+def test_push_reuses_hub_commit_before_loading_missing_artifact(tmp_path, hub_dependencies):
+    hf_api, push_to_hub = hub_dependencies
+    reference = {
+        "uri": (tmp_path / "deleted.json").as_uri(),
+        "fingerprint": "f" * 64,
+        "repository_id": "org/source",
+        "revision": "source-sha",
+    }
+    target_marker = _publication_marker(
+        "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
+    )
+    marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
+    commit = SimpleNamespace(commit_id="b" * 40, title=f"Publish [{marker}]", message="")
+    hf_api.return_value.list_repo_commits.return_value = [commit]
+    operator = PushToHubOperator(
+        task_id="recover_missing", input_uri=reference, repo_id="org/data", huggingface_conn_id="huggingface_test"
+    )
+    with patch("airflow.providers.huggingface.operators.datasets._load_artifact") as load:
+        result = operator.execute({})
+    load.assert_not_called()
+    push_to_hub.assert_not_called()
+    assert result["commit_sha"] == "b" * 40
 
 
 def test_datasets_floor_returns_hub_commit_info():
@@ -303,8 +340,11 @@ def test_datasets_floor_returns_hub_commit_info():
 def test_state_store_write_failure_retry_does_not_push_twice(tmp_path, hub_dependencies):
     hf_api, push_to_hub = hub_dependencies
     reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "retry_after_push.json").as_uri())
-    marker = f"airflow-artifact-sha256:{reference['fingerprint']}"
-    commit = commit_info(oid="a" * 40, message=f"Publish [{marker}]")
+    target_marker = _publication_marker(
+        "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
+    )
+    marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
+    commit = SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}]", message="")
     hf_api.return_value.list_repo_commits.side_effect = [[], [commit]]
     push_to_hub.return_value = commit
     operator = PushToHubOperator(task_id="retry_after_push", input_uri=reference, repo_id="org/data",
@@ -320,6 +360,56 @@ def test_state_store_write_failure_retry_does_not_push_twice(tmp_path, hub_depen
     retry_result = operator.execute({"task_state_store": Store()})
     push_to_hub.assert_called_once()
     assert retry_result["commit_sha"] == "a" * 40
+
+
+def test_push_does_not_treat_intermediate_upload_part_as_published(tmp_path, hub_dependencies):
+    hf_api, push_to_hub = hub_dependencies
+    reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "partial.json").as_uri())
+    target_marker = _publication_marker(
+        "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
+    )
+    marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
+    hf_api.return_value.list_repo_commits.return_value = [
+        SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}] (part 1-of-2)", message="")
+    ]
+    pushed_commit = commit_info(oid="b" * 40)
+    push_to_hub.return_value = pushed_commit
+
+    operator = PushToHubOperator(
+        task_id="partial_upload", input_uri=reference, repo_id="org/data", huggingface_conn_id="huggingface_test"
+    )
+    result = operator.execute({})
+
+    push_to_hub.assert_called_once()
+    assert result["commit_sha"] == pushed_commit.oid
+
+
+def test_push_idempotency_marker_is_scoped_to_config_revision_and_pr_target(tmp_path):
+    reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "targets.json").as_uri())
+    commits = [commit_info(oid=f"{index:040x}") for index in range(1, 4)]
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+        hook = hook_type.return_value
+        hook.find_publication_commit.return_value = None
+        hook.push_to_hub.side_effect = commits
+        configs = [
+            ("config-a", {"revision": "branch-a"}),
+            ("config-b", {"revision": "branch-a"}),
+            ("config-b", {"revision": "branch-b", "create_pr": True}),
+        ]
+        for index, (config, push_kwargs) in enumerate(configs):
+            operator = PushToHubOperator(
+                task_id=f"publish_{index}",
+                input_uri=reference,
+                repo_id="org/data",
+                config=config,
+                push_kwargs=push_kwargs,
+                huggingface_conn_id=None,
+            )
+            operator.execute({})
+
+    markers = [call.kwargs["marker"] for call in hook.find_publication_commit.call_args_list]
+    assert len(set(markers)) == 3
+    assert hook.find_publication_commit.call_args_list[2].kwargs["include_pull_requests"] is True
 
 
 def test_load_retry_reuses_resolved_revision_from_task_state_store(tmp_path, monkeypatch):

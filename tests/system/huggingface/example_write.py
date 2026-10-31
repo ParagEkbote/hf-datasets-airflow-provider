@@ -18,7 +18,7 @@
 import os
 
 from airflow.sdk import DAG, task
-from airflow.task.trigger_rule import TriggerRule
+from airflow.providers.common.compat.sdk import TriggerRule
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 from airflow.providers.huggingface.operators.datasets import (

@@ -22,8 +22,10 @@ Examples that create durable artifacts write under `/tmp/hf-datasets`. This
 works for a single-worker tutorial. Multi-worker deployments need a shared
 writable filesystem at the same path on each worker; change the `file://` URIs
 to that deployment's shared location. For object storage, install the matching
-Airflow provider and filesystem dependency, configure the connection, and use
-an ``s3://`` or ``gs://`` artifact URI. Operators exchange compact references
+Airflow provider and filesystem dependency, then include the connection ID in
+the URI, for example ``s3://aws_default@bucket/path/data.json`` or
+``gs://google_cloud_default@bucket/path/data.json``. A bare remote URI uses the
+filesystem's default credential chain. Operators exchange compact references
 through XCom, never dataset contents. The streaming publisher sends the
 ``IterableDataset`` directly to the Hub and returns only commit metadata.
 

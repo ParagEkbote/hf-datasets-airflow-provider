@@ -11,10 +11,16 @@ LoadDatasetOperator
 
 ``LoadDatasetOperator`` accepts ``path``, ``output_uri``, optional ``name``
 (dataset configuration), ``split``, ``revision``, ``cache_dir``,
-``download_mode`` and ``load_kwargs``. It persists the result and returns the
+``download_mode``, ``load_kwargs``, and ``durable`` (default ``True``). It
+persists the result and returns the
 artifact URI plus source ID, resolved revision, configuration, split, row
 counts, and feature descriptions. It resolves a Hub source to a commit before
 loading; pin a commit SHA in ``revision`` for reproducible inputs.
+
+With ``durable=True``, the operator stores the resolved source revision in
+Airflow's task state store so retries use the same Hub commit. Set it to
+``False`` to resolve the revision again on each attempt without task-state
+reuse.
 
 The default ``reuse_dataset_if_exists`` mode reuses Datasets' valid cache.
 ``force_redownload`` forces a new download. ``cache_dir`` isolates cache data;
@@ -49,12 +55,16 @@ a Python list, stored in XCom, or written to a local artifact first.
 
 The operator accepts ``path``, ``repo_id``, optional ``name``, ``split``,
 ``revision``, ``config``, ``private``, ``commit_message``,
-``huggingface_conn_id``, and ``push_kwargs``. It returns the Hub repository,
+``huggingface_conn_id``, ``push_kwargs``, and ``durable`` (default ``True``).
+With durability enabled, it pins the resolved Hub source revision and reuses a
+completed push from task state or the matching final Hub commit on retry. Set
+``durable=False`` to disable those reuse checks. It returns the Hub repository,
 commit SHA and URL, source revision, configuration, split, and
 ``streaming=True``. After a successful push it emits the matching
 ``hf://datasets/<repo_id>`` asset event. A run marker in the commit message
-lets a retry recover a completed push if the worker exited before Airflow
-recorded the result.
+identifies the source and target for this DAG run. A retry searches the target
+branch or pull request refs and accepts only a final upload commit; intermediate
+parts of a multi-commit upload do not count as completed publication.
 
 Unlike the local Parquet artifact path, this operator delegates feature
 serialization to Datasets' Hub upload implementation and does not use the
@@ -86,18 +96,30 @@ PushToHubOperator
 Required parameters are ``input_uri`` (the full artifact reference, including
 fingerprint) and ``repo_id``. ``config``, ``private``, ``commit_message``,
 ``huggingface_conn_id``, and ``push_kwargs`` configure publication. The
-operator verifies the manifest fingerprint and per-split checksums before
-uploading. It returns ``repository_id``, the Hub ``CommitInfo.oid`` as
-``commit_sha``, ``CommitInfo.commit_url`` as ``commit_url``, the artifact
-fingerprint, and source provenance. Hub exceptions propagate without wrapping.
+operator accepts ``durable`` (default ``True``) in addition to its publication
+options. It verifies the manifest fingerprint and per-split checksums before
+uploading. With durability enabled it checks Airflow task state and the target
+Hub revision for a completed publication before loading Parquet data; a retry
+can therefore return the prior result even if the artifact is no longer on the
+worker. Set ``durable=False`` to always load and push the artifact without
+state or Hub-marker reuse. It returns ``repository_id``, the Hub commit identifier as
+``commit_sha``, the commit URL as ``commit_url``, the artifact fingerprint,
+and source provenance. Both live ``CommitInfo`` and recovered
+``GitCommitInfo`` records are supported. Hub exceptions propagate without
+wrapping.
 
-The commit message includes an artifact fingerprint marker. Airflow 3.3 and
-later task state store support caches the result when that facility is
-available. The marker also lets a retry find a successfully created data commit
-if the worker exited before saving task state. The task emits an asset event
-with the same commit SHA and URL only after successful publication. Publication
-uses Datasets ``push_to_hub``, which rewrites the README's YAML card metadata,
-including ``dataset_info`` and ``configs``, in the push commit.
+The commit message includes an artifact fingerprint and target marker. The
+marker distinguishes repository configuration, revision, and pull request
+target, so publishing the same artifact to another target is a separate
+publication. Airflow 3.3 and later task state store support caches the result
+when that facility is available. Otherwise a retry searches the intended
+branch or pull request refs and only reuses the final part of a multi-commit
+upload. This lets it recover a completed push if the worker exited before
+saving task state without treating an intermediate part as complete. The task
+emits an asset event with the same commit SHA and URL only after successful
+publication. Publication uses Datasets ``push_to_hub``, which rewrites the
+README's YAML card metadata, including ``dataset_info`` and ``configs``, in the
+push commit.
 
 Example
 -------

@@ -21,17 +21,13 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import tempfile
 from typing import Any, Callable
 
 import pyarrow.parquet as parquet
-from datasets import ClassLabel, Dataset, DatasetDict, DatasetInfo, Features, Sequence, Value
+from datasets import ClassLabel, Dataset, DatasetDict, Features, Sequence, Value
 
-from airflow.sdk.bases.operator import BaseOperator
-try:
-    from airflow.sdk import Asset, ObjectStoragePath
-except ImportError:  # pragma: no cover - compatibility for early Airflow 3 releases
-    from airflow.sdk import Asset
-    from airflow.providers.common.io.path import ObjectStoragePath
+from airflow.providers.common.compat.sdk import Asset, BaseOperator, Context, ObjectStoragePath
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 
@@ -113,6 +109,12 @@ def _save(
                 "uri": split_uri,
                 "rows": len(part),
                 "features": part.features.to_dict(),
+                "feature_order": list(part.features),
+                "split": (
+                    str(part.split)
+                    if getattr(part, "split", None) is not None
+                    else (name if name != "dataset" else None)
+                ),
                 "sha256": _sha256_path(split_uri),
             }
 
@@ -130,7 +132,11 @@ def _save(
             "uri": uri,
             "format": "parquet",
             "splits": {
-                name: {"rows": part_info["rows"], "features": part_info["features"]}
+                name: {
+                    "rows": part_info["rows"],
+                    "features": part_info["features"],
+                    "split": part_info["split"],
+                }
                 for name, part_info in split_manifest.items()
             },
             **(metadata or {}),
@@ -151,7 +157,7 @@ def _save(
         raise
 
 
-def _load_artifact(reference: str | dict[str, Any]) -> Dataset | DatasetDict:
+def _read_artifact_manifest(reference: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
     uri = _reference(reference)
     manifest_path = _path(uri)
     with manifest_path.open("rb") as stream:
@@ -164,23 +170,67 @@ def _load_artifact(reference: str | dict[str, Any]) -> Dataset | DatasetDict:
     manifest = json.loads(manifest_bytes)
     if manifest.get("format") != "parquet" or manifest.get("version") != 1:
         raise ValueError(f"Unsupported dataset artifact manifest: {uri}")
+    return uri, manifest
+
+
+def _load_artifact(
+    reference: str | dict[str, Any],
+    *,
+    cache_dir: str | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> Dataset | DatasetDict:
+    uri, manifest = _read_artifact_manifest(reference) if manifest is None else (_reference(reference), manifest)
+    resolved_cache_dir = cache_dir or str(Path(tempfile.gettempdir()) / "airflow-hf-datasets-cache")
+    Path(resolved_cache_dir).mkdir(parents=True, exist_ok=True)
     parts: dict[str, Dataset] = {}
-    for name, item in manifest["splits"].items():
-        split_uri = item["uri"]
-        if _sha256_path(split_uri) != item.get("sha256"):
-            raise ValueError(f"Dataset artifact split fingerprint mismatch: {split_uri}")
-        with _path(split_uri).open("rb") as stream:
-            table = parquet.read_table(stream)
-        features = Features.from_dict(item["features"])
-        parts[name] = Dataset(table, info=DatasetInfo(features=features))
+    with tempfile.TemporaryDirectory(prefix="airflow-hf-parquet-") as local_dir:
+        for index, (name, item) in enumerate(manifest["splits"].items()):
+            split_uri = item["uri"]
+            local_path = Path(local_dir) / f"split-{index:05d}.parquet"
+            digest = hashlib.sha256()
+            with _path(split_uri).open("rb") as source, local_path.open("wb") as target:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                    target.write(chunk)
+            if digest.hexdigest() != item.get("sha256"):
+                raise ValueError(f"Dataset artifact split fingerprint mismatch: {split_uri}")
+
+            feature_data = item["features"]
+            feature_order = item.get("feature_order", list(feature_data))
+            features = Features.from_dict({key: feature_data[key] for key in feature_order})
+            split_name = item.get("split") or (name if name != "dataset" else None)
+            restored = Dataset.from_parquet(
+                str(local_path),
+                features=features,
+                split=split_name,
+                cache_dir=resolved_cache_dir,
+            )
+            # Parquet readers may return fields in physical/file order; restore the
+            # manifest's declared feature order for stable downstream transforms.
+            parts[name] = restored.select_columns(list(features))
     return parts["dataset"] if list(parts) == ["dataset"] else DatasetDict(parts)
 
 
-def _task_key(context: dict[str, Any], prefix: str, identity: str) -> str:
-    ti = context.get("ti") or context.get("task_instance")
-    dag_id = getattr(ti, "dag_id", "unknown-dag")
-    task_id = getattr(ti, "task_id", "unknown-task")
-    return f"huggingface-{prefix}:{dag_id}:{task_id}:{identity}"
+def _state_key(prefix: str, identity: str) -> str:
+    """Task state stores already scope keys to a DAG run and task instance."""
+    return f"{prefix}:{identity}"
+
+
+def _publication_marker(prefix: str, identity: dict[str, Any]) -> str:
+    payload = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    return f"{prefix}:{hashlib.sha256(payload).hexdigest()}"
+
+
+def _commit_details(commit: Any, repo_id: str, hook: HuggingFaceHook) -> tuple[str, str]:
+    """Normalize CommitInfo and GitCommitInfo returned by Hub APIs."""
+    commit_sha = getattr(commit, "oid", None) or getattr(commit, "commit_id", None)
+    if not commit_sha:
+        raise ValueError(f"Hub publication for {repo_id!r} returned no commit identifier")
+    commit_url = getattr(commit, "commit_url", None)
+    if not commit_url:
+        endpoint = getattr(hook.get_conn(), "endpoint", "https://huggingface.co").rstrip("/")
+        commit_url = f"{endpoint}/datasets/{repo_id}/commit/{commit_sha}"
+    return commit_sha, commit_url
 
 
 def _is_hub_repo(path: str) -> bool:
@@ -192,7 +242,6 @@ class LoadDatasetOperator(BaseOperator):
     """Load a dataset revision and persist it as a Parquet artifact."""
 
     template_fields = ("path", "name", "split", "revision", "cache_dir", "output_uri")
-    _PINNED_REVISION_KEY = "pinned_revision"
 
     def __init__(
         self,
@@ -215,13 +264,13 @@ class LoadDatasetOperator(BaseOperator):
         self.huggingface_conn_id, self.load_kwargs = huggingface_conn_id, load_kwargs or {}
         self.durable = durable
 
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, context: Context) -> dict[str, Any]:
         hook = HuggingFaceHook(self.huggingface_conn_id)
         requested_revision = self.revision
         is_hub_repo = _is_hub_repo(self.path)
         state = context.get("task_state_store") if self.durable else None
         state_identity = json.dumps([self.path, requested_revision], separators=(",", ":"))
-        state_key = _task_key(context, "load", state_identity)
+        state_key = _state_key("load-revision", state_identity)
         revision = state.get(state_key) if state is not None else None
         if revision is None:
             revision = requested_revision
@@ -229,6 +278,8 @@ class LoadDatasetOperator(BaseOperator):
                 revision = hook.get_dataset_info(self.path, requested_revision).sha
             if state is not None and revision is not None:
                 state.set(state_key, revision)
+        elif state is not None:
+            self.log.info("Reusing pinned Hugging Face dataset revision %s for %s", revision, self.path)
 
         kwargs = dict(self.load_kwargs)
         kwargs["download_mode"] = self.download_mode
@@ -271,6 +322,7 @@ class StreamDatasetOperator(BaseOperator):
         transform_kwargs: dict[str, Any] | None = None,
         push_kwargs: dict[str, Any] | None = None,
         huggingface_conn_id: str | None = "huggingface_default",
+        durable: bool = True,
         **kwargs: Any,
     ) -> None:
         if "{{" in repo_id:
@@ -286,6 +338,7 @@ class StreamDatasetOperator(BaseOperator):
         self.transform_kwargs = transform_kwargs or {}
         self.push_kwargs = push_kwargs or {}
         self.huggingface_conn_id = huggingface_conn_id
+        self.durable = durable
         self.published_asset = Asset(uri=f"hf://datasets/{repo_id}")
         user_outlets = kwargs.pop("outlets", None)
         if user_outlets is None:
@@ -294,17 +347,66 @@ class StreamDatasetOperator(BaseOperator):
             user_outlets = [user_outlets]
         super().__init__(outlets=[*user_outlets, self.published_asset], **kwargs)
 
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
+    def execute(self, context: Context) -> dict[str, Any]:
         hook = HuggingFaceHook(self.huggingface_conn_id)
-        revision = self.revision
         is_hub_repo = _is_hub_repo(self.path)
-        if is_hub_repo:
-            revision = hook.get_dataset_info(self.path, revision).sha
+        requested_revision = self.revision
+        state = context.get("task_state_store") if self.durable else None
+        revision_identity = json.dumps(
+            [self.path, requested_revision, self.name, self.split], separators=(",", ":")
+        )
+        revision_key = _state_key("stream-revision", revision_identity)
+        revision = state.get(revision_key) if state is not None else None
+        if revision is None:
+            revision = requested_revision
+            if is_hub_repo:
+                revision = hook.get_dataset_info(self.path, requested_revision).sha
+            if state is not None and revision is not None:
+                state.set(revision_key, revision)
+        elif state is not None:
+            self.log.info("Reusing pinned Hugging Face streaming revision %s for %s", revision, self.path)
 
-        ti = context.get("ti") or context.get("task_instance")
-        run_id = context.get("run_id") or getattr(ti, "run_id", "manual")
-        marker = _task_key(context, "stream-publish", f"{self.repo_id}:{run_id}")
-        commit = hook.find_commit_by_marker(self.repo_id, marker)
+        run_id = context.get("run_id", "manual")
+        push_kwargs = dict(self.push_kwargs)
+        if self.config is not None:
+            push_kwargs["config_name"] = self.config
+        if self.private is not None:
+            push_kwargs["private"] = self.private
+        marker = _publication_marker(
+            "huggingface-stream-publish",
+            {
+                "task_id": self.task_id,
+                "run_id": run_id,
+                "source": self.path,
+                "source_revision": revision,
+                "name": self.name,
+                "split": self.split,
+                "repo_id": self.repo_id,
+                "config_name": push_kwargs.get("config_name", "default"),
+                "revision": push_kwargs.get("revision", "main"),
+                "create_pr": bool(push_kwargs.get("create_pr", False)),
+            },
+        )
+        state_key = _state_key("stream-publication", marker)
+        if state is not None:
+            prior_result = state.get(state_key)
+            if prior_result:
+                self.log.info("Reusing stored streaming publication result for %s", self.repo_id)
+                self._emit_asset_event(context, prior_result)
+                return prior_result
+
+        target_revision = push_kwargs.get("revision")
+        include_pull_requests = bool(push_kwargs.get("create_pr", False))
+        commit = None
+        if self.durable:
+            commit = hook.find_commit_by_marker(
+                self.repo_id,
+                marker,
+                revision=target_revision,
+                include_pull_requests=include_pull_requests,
+            )
+            if commit is not None:
+                self.log.info("Reusing existing completed streaming publication to %s", self.repo_id)
 
         if commit is None:
             load_kwargs: dict[str, Any] = {"streaming": True}
@@ -321,25 +423,25 @@ class StreamDatasetOperator(BaseOperator):
             if self.predicate is not None:
                 stream = stream.filter(self.predicate)
 
-            push_kwargs = dict(self.push_kwargs)
-            if self.config is not None:
-                push_kwargs["config_name"] = self.config
-            if self.private is not None:
-                push_kwargs["private"] = self.private
             message = self.commit_message or "Stream dataset from Airflow"
             push_kwargs["commit_message"] = f"{message} [{marker}]"
             commit = hook.push_to_hub(stream, self.repo_id, **push_kwargs)
             # A retry can recover the completed Hub commit if the worker exited
             # after upload but before Airflow recorded the task result.
             if commit is None:
-                commit = hook.find_commit_by_marker(self.repo_id, marker)
+                if self.durable:
+                    commit = hook.find_commit_by_marker(
+                        self.repo_id,
+                        marker,
+                        revision=target_revision,
+                        include_pull_requests=include_pull_requests,
+                    )
 
-        commit_sha = getattr(commit, "oid", None)
-        commit_url = getattr(commit, "commit_url", None)
-        if commit_sha is None:
-            commit_sha = hook.get_dataset_info(self.repo_id).sha
-        if commit_url is None:
-            commit_url = f"https://huggingface.co/datasets/{self.repo_id}/commit/{commit_sha}"
+        if commit is None:
+            raise RuntimeError(
+                f"Hub push to {self.repo_id!r} completed without returning or exposing a commit for marker {marker}"
+            )
+        commit_sha, commit_url = _commit_details(commit, self.repo_id, hook)
         result = {
             "repository_id": self.repo_id,
             "commit_sha": commit_sha,
@@ -351,10 +453,12 @@ class StreamDatasetOperator(BaseOperator):
             "split": self.split,
             "streaming": True,
         }
+        if state is not None:
+            state.set(state_key, result)
         self._emit_asset_event(context, result)
         return result
 
-    def _emit_asset_event(self, context: dict[str, Any], publication: dict[str, Any]) -> None:
+    def _emit_asset_event(self, context: Context, publication: dict[str, Any]) -> None:
         events = context.get("outlet_events")
         if events is not None:
             events[self.published_asset].extra = {
@@ -368,7 +472,7 @@ class StreamDatasetOperator(BaseOperator):
 class MapDatasetOperator(BaseOperator):
     """Apply a Python callable and persist the transformed artifact."""
 
-    template_fields = ("input_uri", "output_uri", "transform_kwargs")
+    template_fields = ("input_uri", "output_uri", "transform_kwargs", "cache_dir")
 
     def __init__(
         self,
@@ -378,6 +482,7 @@ class MapDatasetOperator(BaseOperator):
         transform: Callable[..., Any],
         transform_kwargs: dict[str, Any] | None = None,
         map_kwargs: dict[str, Any] | None = None,
+        cache_dir: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -385,9 +490,10 @@ class MapDatasetOperator(BaseOperator):
             raise TypeError("transform must be a callable")
         self.input_uri, self.output_uri, self.transform = input_uri, output_uri, transform
         self.transform_kwargs, self.map_kwargs = transform_kwargs or {}, map_kwargs or {}
+        self.cache_dir = cache_dir
 
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        dataset = _load_artifact(self.input_uri)
+    def execute(self, context: Context) -> dict[str, Any]:
+        dataset = _load_artifact(self.input_uri, cache_dir=self.cache_dir)
         mapped = dataset.map(self.transform, fn_kwargs=self.transform_kwargs, **self.map_kwargs)
         source = self.input_uri if isinstance(self.input_uri, dict) else {}
         provenance = {
@@ -413,6 +519,7 @@ class PushToHubOperator(BaseOperator):
         commit_message: str | None = None,
         huggingface_conn_id: str | None = "huggingface_default",
         push_kwargs: dict[str, Any] | None = None,
+        durable: bool = True,
         **kwargs: Any,
     ) -> None:
         if "{{" in repo_id:
@@ -420,6 +527,7 @@ class PushToHubOperator(BaseOperator):
         self.input_uri, self.repo_id, self.config = input_uri, repo_id, config
         self.private, self.commit_message = private, commit_message
         self.huggingface_conn_id, self.push_kwargs = huggingface_conn_id, push_kwargs or {}
+        self.durable = durable
         self.published_asset = Asset(uri=f"hf://datasets/{repo_id}")
         user_outlets = kwargs.pop("outlets", None)
         if user_outlets is None:
@@ -428,37 +536,72 @@ class PushToHubOperator(BaseOperator):
             user_outlets = [user_outlets]
         super().__init__(outlets=[*user_outlets, self.published_asset], **kwargs)
 
-    def execute(self, context: dict[str, Any]) -> dict[str, Any]:
-        dataset = _load_artifact(self.input_uri)
+    def execute(self, context: Context) -> dict[str, Any]:
         source = self.input_uri if isinstance(self.input_uri, dict) else {}
         fingerprint = source.get("fingerprint")
         if not fingerprint:
             raise ValueError("Publication requires an artifact reference with a fingerprint")
-        marker = f"airflow-artifact-sha256:{fingerprint}"
-        state = context.get("task_state_store")
-        state_key = _task_key(context, "publication", f"{self.repo_id}:{fingerprint}")
+        kwargs = dict(self.push_kwargs)
+        if self.config is not None:
+            kwargs["config_name"] = self.config
+        if self.private is not None:
+            kwargs["private"] = self.private
+        target_revision = kwargs.get("revision")
+        create_pr = bool(kwargs.get("create_pr", False))
+        target_marker = _publication_marker(
+            "target",
+            {
+                "repo_id": self.repo_id,
+                "config_name": kwargs.get("config_name", "default"),
+                "revision": target_revision or "main",
+                "create_pr": create_pr,
+            },
+        )
+        marker = f"airflow-artifact-sha256:{fingerprint}:{target_marker}"
+        state = context.get("task_state_store") if self.durable else None
+        state_key = _state_key("publication", marker)
         if state is not None:
             prior_result = state.get(state_key)
             if prior_result:
+                self.log.info("Reusing stored publication result for %s", self.repo_id)
                 self._emit_asset_event(context, prior_result)
                 return prior_result
 
         hook = HuggingFaceHook(self.huggingface_conn_id)
-        commit = hook.find_publication_commit(self.repo_id, fingerprint)
+        commit = None
+        if self.durable:
+            commit = hook.find_publication_commit(
+                self.repo_id,
+                fingerprint,
+                marker=marker,
+                revision=target_revision,
+                include_pull_requests=create_pr,
+            )
+            if commit is not None:
+                self.log.info("Reusing existing completed publication to %s", self.repo_id)
         if commit is None:
-            kwargs = dict(self.push_kwargs)
-            if self.config is not None:
-                kwargs["config_name"] = self.config
-            if self.private is not None:
-                kwargs["private"] = self.private
+            dataset = _load_artifact(self.input_uri)
             message = self.commit_message or "Publish dataset from Airflow"
             kwargs["commit_message"] = f"{message} [{marker}]"
             commit = hook.push_to_hub(dataset, self.repo_id, **kwargs)
+            if commit is None and self.durable:
+                commit = hook.find_publication_commit(
+                    self.repo_id,
+                    fingerprint,
+                    marker=marker,
+                    revision=target_revision,
+                    include_pull_requests=create_pr,
+                )
 
+        if commit is None:
+            raise RuntimeError(
+                f"Hub push to {self.repo_id!r} completed without returning or exposing a final commit for {marker}"
+            )
+        commit_sha, commit_url = _commit_details(commit, self.repo_id, hook)
         result = {
             "repository_id": self.repo_id,
-            "commit_sha": commit.oid,
-            "commit_url": commit.commit_url,
+            "commit_sha": commit_sha,
+            "commit_url": commit_url,
             "url": f"https://huggingface.co/datasets/{self.repo_id}",
             "fingerprint": fingerprint,
             "source_repository_id": source.get("repository_id"),
@@ -469,7 +612,7 @@ class PushToHubOperator(BaseOperator):
         self._emit_asset_event(context, result)
         return result
 
-    def _emit_asset_event(self, context: dict[str, Any], publication: dict[str, Any]) -> None:
+    def _emit_asset_event(self, context: Context, publication: dict[str, Any]) -> None:
         events = context.get("outlet_events")
         if events is not None:
             events[self.published_asset].extra = {

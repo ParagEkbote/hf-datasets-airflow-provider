@@ -8,10 +8,14 @@ revision, split names, row counts, and serialized Hugging Face ``Features``.
 Downstream tasks should pass the complete reference, rather than only its URI,
 to retain fingerprint validation and provenance.
 
-The manifest and per-split SHA-256 checksums detect changed or incomplete artifacts. The manifest preserves column names and order through the serialized Features
-schema and records ``DatasetDict`` split names. Reconstruction uses
-``Features.from_dict`` and a PyArrow Parquet reader before rebuilding each
-Datasets ``Dataset`` object. The artifact writer enforces a hard feature
+The manifest and per-split SHA-256 checksums detect changed or incomplete
+artifacts. The manifest preserves column names and order, records each
+Dataset's split name, and retains DatasetDict split keys. The reader copies
+each Parquet object to a local temporary file
+while hashing it, then opens the verified copy with ``Dataset.from_parquet``.
+This avoids reading a remote split twice and keeps the returned Dataset backed
+by its local Arrow cache files, so mapping tasks can process it without first
+holding the whole split in memory. The artifact writer enforces a hard feature
 whitelist before writing: only ``Value`` and ``ClassLabel`` features,
 recursively nested in ``Sequence``, list/tuple, and dictionary structures,
 are supported. ``Image``, ``Audio``, ``Video``, ``Array2D`` and other array
@@ -19,10 +23,13 @@ features, and every other feature class are rejected with ``ValueError``.
 
 The format is designed for ``file://``, ``s3://``, and ``gs://`` paths through
 Airflow ``ObjectStoragePath``. Remote schemes need their matching Airflow
-storage provider, filesystem dependency, connection, and permissions installed
-on every worker. This package does not claim a distributed storage backend is
-available merely because the URI parses. Local files require a shared path if
-tasks run on different workers. A failed write can leave an incomplete
+storage provider and filesystem dependency installed on every worker. Put the
+Airflow connection ID in the URI's user-info section, such as
+``s3://aws_default@my-bucket/path/data.json`` or
+``gs://google_cloud_default@my-bucket/path/data.json``. A bare URI without a
+connection ID uses the filesystem's default credential chain; configuring an
+Airflow connection alone does not select it. Local files require a shared path
+if tasks run on different workers. A failed write can leave an incomplete
 manifest or orphaned split objects; rerunning the writer overwrites those
 objects. Configure object-store lifecycle cleanup for abandoned temporary
 objects. Publication checks the manifest fingerprint before upload.

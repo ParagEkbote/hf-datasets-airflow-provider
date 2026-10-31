@@ -35,9 +35,12 @@ Install into an Airflow environment with Python 3.10 through 3.13:
    pip install apache-airflow-providers-huggingface
 
 The provider requires Apache Airflow 3.0 or later, ``datasets>=3.4.0,<5``,
-``huggingface-hub>=0.24,<2``, and Airflow common I/O. For ``s3://`` and
-``gs://`` artifacts, also install the corresponding storage provider and
-filesystem dependency and configure its Airflow connection.
+and ``huggingface-hub>=0.24,<2``. For ``s3://`` and ``gs://`` artifacts,
+install the corresponding storage provider and filesystem dependency. Select
+the Airflow connection in the URI, for example
+``s3://aws_default@my-bucket/path/data.json`` or
+``gs://google_cloud_default@my-bucket/path/data.json``. Without a connection
+ID in the URI, the filesystem uses its default credential chain.
 
 Guides
 ------

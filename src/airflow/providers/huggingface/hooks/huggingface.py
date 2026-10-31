@@ -21,12 +21,10 @@ from typing import Any
 
 from datasets import load_dataset
 from huggingface_hub import HfApi
-from huggingface_hub.utils import RepositoryNotFoundError
+from huggingface_hub.utils import RepositoryNotFoundError, RevisionNotFoundError
 
-try:
-    from airflow.sdk.bases.hook import BaseHook
-except ImportError:
-    from airflow.hooks.base import BaseHook
+from airflow.exceptions import AirflowNotFoundException
+from airflow.providers.common.compat.sdk import BaseHook
 
 
 class HuggingFaceHook(BaseHook):
@@ -52,9 +50,8 @@ class HuggingFaceHook(BaseHook):
             return None
         try:
             connection = self.get_connection(self.huggingface_conn_id)
-        except Exception as exc:
-            from airflow.exceptions import AirflowNotFoundException
-            if isinstance(exc, AirflowNotFoundException) and self._allow_ambient_fallback:
+        except AirflowNotFoundException:
+            if self._allow_ambient_fallback:
                 return None
             raise
         return connection.password or None
@@ -80,22 +77,76 @@ class HuggingFaceHook(BaseHook):
     def get_dataset_info(self, repo_id: str, revision: str | None = None) -> Any:
         return self.get_conn().dataset_info(repo_id, revision=revision)
 
-    def find_publication_commit(self, repo_id: str, fingerprint: str) -> Any | None:
-        """Find a prior commit for this artifact after a worker crash."""
-        return self.find_commit_by_marker(repo_id, f"airflow-artifact-sha256:{fingerprint}")
+    def find_publication_commit(
+        self,
+        repo_id: str,
+        fingerprint: str,
+        *,
+        marker: str,
+        revision: str | None = None,
+        include_pull_requests: bool = False,
+    ) -> Any | None:
+        """Find a completed artifact publication after a worker crash."""
+        return self.find_commit_by_marker(
+            repo_id,
+            marker,
+            revision=revision,
+            include_pull_requests=include_pull_requests,
+        )
 
-    def find_commit_by_marker(self, repo_id: str, marker: str) -> Any | None:
-        """Find a prior dataset commit containing a caller-provided marker."""
-        try:
-            commits = self.get_conn().list_repo_commits(repo_id, repo_type="dataset")
-        except RepositoryNotFoundError:
-            return None
-        for commit in commits:
-            # huggingface_hub's CommitInfo exposes ``commit_message`` while
-            # some API response versions and test doubles expose ``message``.
-            message = getattr(commit, "message", None) or getattr(commit, "commit_message", "")
-            if marker in (message or ""):
-                return commit
+    @staticmethod
+    def _commit_is_complete(commit: Any) -> bool:
+        """Reject intermediate commits from a Hub upload split into parts."""
+        import re
+
+        title = getattr(commit, "title", "") or ""
+        part = re.search(r"\(part\s+(\d+)(?:\s*(?:-of-|of|-)\s*(\d+))?\)\s*$", title, re.IGNORECASE)
+        if part is None:
+            return not re.search(r"\(part\b.*\)\s*$", title, re.IGNORECASE)
+        # Some upload clients only report "part N" without the total. That
+        # cannot prove that this is the final part, so do not recover from it.
+        return part.group(2) is not None and part.group(1) == part.group(2)
+
+    def find_commit_by_marker(
+        self,
+        repo_id: str,
+        marker: str,
+        *,
+        revision: str | None = None,
+        include_pull_requests: bool = False,
+    ) -> Any | None:
+        """Find the final upload commit matching a marker on the requested ref."""
+        api = self.get_conn()
+        revisions = [revision] if revision else ["main"]
+        if include_pull_requests:
+            try:
+                refs = api.list_repo_refs(repo_id, repo_type="dataset", include_pull_requests=True)
+            except RepositoryNotFoundError:
+                return None
+            revisions.extend(ref.ref for ref in getattr(refs, "pull_requests", []) or [])
+
+        seen: set[str] = set()
+        for ref in revisions:
+            if ref in seen:
+                continue
+            seen.add(ref)
+            try:
+                commits = api.list_repo_commits(repo_id, repo_type="dataset", revision=ref)
+            except RepositoryNotFoundError:
+                return None
+            except RevisionNotFoundError:
+                continue
+            for commit in commits:
+                # GitCommitInfo carries title/message/commit_id; CommitInfo
+                # carries commit_message/commit_description/oid.
+                fields = (
+                    getattr(commit, "title", ""),
+                    getattr(commit, "message", ""),
+                    getattr(commit, "commit_message", ""),
+                    getattr(commit, "commit_description", ""),
+                )
+                if any(marker in (field or "") for field in fields) and self._commit_is_complete(commit):
+                    return commit
         return None
 
     def push_to_hub(self, dataset: Any, repo_id: str, **kwargs: Any) -> Any:

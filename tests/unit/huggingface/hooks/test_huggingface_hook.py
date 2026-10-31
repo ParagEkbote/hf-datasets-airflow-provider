@@ -1,9 +1,26 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 """Connection-backed authentication tests for HuggingFaceHook."""
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 from airflow.exceptions import AirflowNotFoundException
-from airflow.sdk.bases.hook import BaseHook
+from airflow.providers.common.compat.sdk import BaseHook
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 
@@ -102,3 +119,37 @@ def test_connection_extra_token_is_ignored(monkeypatch):
     monkeypatch.setenv("AIRFLOW_CONN_HUGGINGFACE_EXTRA_TEST",
                        '{"conn_type":"huggingface","extra":{"token":"ignored"}}')
     assert HuggingFaceHook("huggingface_extra_test").get_token() is None
+
+
+def test_find_commit_by_marker_matches_title_and_only_returns_final_upload_part():
+    marker = "airflow-artifact-sha256:abc:target:def"
+    partial = SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}] (part 1-of-2)", message="")
+    final = SimpleNamespace(commit_id="b" * 40, title=f"Publish [{marker}] (part 2-of-2)", message="")
+    with patch("airflow.providers.huggingface.hooks.huggingface.HfApi", autospec=True) as api_type:
+        api_type.return_value.list_repo_commits.return_value = [final, partial]
+        hook = HuggingFaceHook(None)
+        commit = hook.find_commit_by_marker("org/data", marker, revision="release")
+
+    assert commit is final
+    assert not HuggingFaceHook._commit_is_complete(
+        SimpleNamespace(title=f"Publish [{marker}] (part 2)")
+    )
+    api_type.return_value.list_repo_commits.assert_called_once_with(
+        "org/data", repo_type="dataset", revision="release"
+    )
+
+
+def test_find_commit_by_marker_scans_pull_request_refs_when_requested():
+    marker = "huggingface-stream-publish:target"
+    final = SimpleNamespace(commit_id="c" * 40, title=f"Stream [{marker}]", message="")
+    with patch("airflow.providers.huggingface.hooks.huggingface.HfApi", autospec=True) as api_type:
+        api = api_type.return_value
+        api.list_repo_refs.return_value.pull_requests = [SimpleNamespace(ref="refs/pr/7")]
+        api.list_repo_commits.side_effect = [[], [final]]
+        hook = HuggingFaceHook(None)
+        commit = hook.find_commit_by_marker("org/data", marker, include_pull_requests=True)
+
+    assert commit is final
+    api.list_repo_refs.assert_called_once_with("org/data", repo_type="dataset", include_pull_requests=True)
+    assert api.list_repo_commits.call_args_list[0].kwargs["revision"] == "main"
+    assert api.list_repo_commits.call_args_list[1].kwargs["revision"] == "refs/pr/7"
