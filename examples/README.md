@@ -61,7 +61,8 @@ the event-driven flow.
 * **Rotten Tomatoes streaming:** the train split is transformed and filtered lazily, then published progressively to the configured Hub repository without a local artifact.
 * **SQuAD:** train and validation are mapped together and published as a DatasetDict.
 * **Daily refresh:** successful publication emits `hf://datasets/<HF_PRODUCER_REPO_ID>`.
-  The consumer loads that Hub repository, maps it, and publishes its own result.
+  The consumer pins its load to the triggering event's commit, maps it, and
+  publishes its own result.
 
 Each durable `output_uri` identifies a JSON manifest. Its neighboring
 `.split-N.parquet` objects contain data, and the returned artifact reference

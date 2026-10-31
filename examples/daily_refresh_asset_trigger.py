@@ -44,6 +44,8 @@ with DAG("huggingface_daily_refresh_producer", schedule="@daily", tags=["hugging
 
 with DAG("huggingface_daily_refresh_consumer", schedule=[PUBLISHED], tags=["huggingface", "assets", "example"]) as consumer:
     load = LoadDatasetOperator(task_id="load_published_dataset", path=PRODUCER_REPO, split="train",
+        # Pin the load to the commit carried by the event that triggered this run.
+        revision="{{ (triggering_asset_events.values() | first | first).extra['commit_sha'] }}",
         output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/consumer_input.json")
     remap = MapDatasetOperator(task_id="refresh_character_count", input_uri=load.output,
         output_uri="file:///tmp/hf-datasets/{{ dag_id }}/{{ run_id }}/alpaca/consumer_output.json", transform=add_char_count,

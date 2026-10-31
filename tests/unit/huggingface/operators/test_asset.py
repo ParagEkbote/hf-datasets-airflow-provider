@@ -14,10 +14,11 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-import pytest
+from unittest.mock import patch
 from urllib.parse import urlsplit, urlunsplit
 
-from airflow.providers.common.compat.openlineage.facet import Dataset
+import pytest
+
 from airflow.providers.huggingface.asset import (
     convert_asset_to_openlineage,
     create_asset,
@@ -49,10 +50,12 @@ def test_airflow_asset_factory_and_openlineage_converter_signatures():
     assert asset.extra == extra
 
     lineage_context = object()
-    converted = convert_asset_to_openlineage(asset, lineage_context)
-    assert isinstance(converted, Dataset)
-    assert converted.namespace == "https://huggingface.co"
-    assert converted.name == "datasets/org/example"
+    with patch("airflow.providers.common.compat.openlineage.facet.Dataset") as openlineage_dataset:
+        converted = convert_asset_to_openlineage(asset, lineage_context)
+    openlineage_dataset.assert_called_once_with(
+        namespace="https://huggingface.co", name="datasets/org/example", facets={}
+    )
+    assert converted is openlineage_dataset.return_value
 
 
 def test_rejects_malformed_dataset_asset_uri():

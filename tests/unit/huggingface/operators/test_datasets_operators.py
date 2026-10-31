@@ -15,12 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 """Regression coverage for durable load/map/publish behavior."""
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Value
-from huggingface_hub import CommitInfo
+from huggingface_hub import CommitInfo, GitCommitInfo
 
 from airflow.providers.huggingface.operators.datasets import (
     LoadDatasetOperator,
@@ -41,6 +42,18 @@ def add_one(example):
 def commit_info(repo_id="org/data", oid="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", message="publish"):
     url = f"https://huggingface.co/datasets/{repo_id}/commit/{oid}"
     return CommitInfo(commit_url=url, commit_message=message, commit_description="", oid=oid)
+
+
+def git_commit_info(commit_id, title, message=""):
+    return GitCommitInfo(
+        commit_id=commit_id,
+        authors=["unit-test"],
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        title=title,
+        message=message,
+        formatted_title=None,
+        formatted_message=None,
+    )
 
 
 
@@ -101,7 +114,7 @@ def test_stream_operator_lazily_transforms_filters_and_publishes_with_asset_even
     stream.map.return_value = stream
     stream.filter.return_value = stream
     commit = commit_info("org/streamed", message="Stream dataset from Airflow")
-    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook", autospec=True) as hook_type:
         hook = hook_type.return_value
         hook.get_dataset_info.return_value.sha = "pinned-stream-sha"
         hook.load_dataset.return_value = stream
@@ -143,7 +156,7 @@ def test_stream_operator_lazily_transforms_filters_and_publishes_with_asset_even
 
 def test_stream_operator_recovers_prior_commit_without_reloading_stream():
     commit = commit_info("org/streamed")
-    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook", autospec=True) as hook_type:
         hook = hook_type.return_value
         hook.find_commit_by_marker.return_value = commit
         operator = StreamDatasetOperator(
@@ -286,7 +299,7 @@ def test_airflow_30_path_without_state_store_and_retry_with_store(tmp_path, hub_
         "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
     )
     marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
-    commit = SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}]", message="")
+    commit = git_commit_info("a" * 40, f"Publish [{marker}]")
     hf_api.return_value.list_repo_commits.return_value = [commit]
     operator = PushToHubOperator(task_id="legacy", input_uri=reference, repo_id="org/data",
                                  huggingface_conn_id="huggingface_test")
@@ -313,7 +326,7 @@ def test_push_reuses_hub_commit_before_loading_missing_artifact(tmp_path, hub_de
         "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
     )
     marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
-    commit = SimpleNamespace(commit_id="b" * 40, title=f"Publish [{marker}]", message="")
+    commit = git_commit_info("b" * 40, f"Publish [{marker}]")
     hf_api.return_value.list_repo_commits.return_value = [commit]
     operator = PushToHubOperator(
         task_id="recover_missing", input_uri=reference, repo_id="org/data", huggingface_conn_id="huggingface_test"
@@ -332,7 +345,7 @@ def test_state_store_write_failure_retry_does_not_push_twice(tmp_path, hub_depen
         "target", {"repo_id": "org/data", "config_name": "default", "revision": "main", "create_pr": False}
     )
     marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
-    commit = SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}]", message="")
+    commit = git_commit_info("a" * 40, f"Publish [{marker}]")
     hf_api.return_value.list_repo_commits.side_effect = [[], [commit]]
     push_to_hub.return_value = commit
     operator = PushToHubOperator(task_id="retry_after_push", input_uri=reference, repo_id="org/data",
@@ -358,7 +371,7 @@ def test_push_does_not_treat_intermediate_upload_part_as_published(tmp_path, hub
     )
     marker = f"airflow-artifact-sha256:{reference['fingerprint']}:{target_marker}"
     hf_api.return_value.list_repo_commits.return_value = [
-        SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}] (part 1-of-2)", message="")
+        git_commit_info("a" * 40, f"Publish [{marker}] (part 1-of-2)")
     ]
     pushed_commit = commit_info(oid="b" * 40)
     push_to_hub.return_value = pushed_commit
@@ -375,7 +388,7 @@ def test_push_does_not_treat_intermediate_upload_part_as_published(tmp_path, hub
 def test_push_idempotency_marker_is_scoped_to_config_revision_and_pr_target(tmp_path):
     reference = _save(Dataset.from_dict({"value": [1]}), (tmp_path / "targets.json").as_uri())
     commits = [commit_info(oid=f"{index:040x}") for index in range(1, 4)]
-    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
+    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook", autospec=True) as hook_type:
         hook = hook_type.return_value
         hook.find_publication_commit.return_value = None
         hook.push_to_hub.side_effect = commits
@@ -498,7 +511,7 @@ def test_existing_local_path_is_not_treated_as_hub_repo(tmp_path):
     assert _is_hub_repo(str(local_path)) is False
 
     with (
-        patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type,
+        patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook", autospec=True) as hook_type,
         patch("airflow.providers.huggingface.operators.datasets._save") as save,
     ):
         hook = hook_type.return_value

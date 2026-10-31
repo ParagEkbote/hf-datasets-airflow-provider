@@ -18,7 +18,7 @@
 import os
 import uuid
 
-from airflow.sdk import DAG, task
+from airflow.sdk import Asset, DAG, get_current_context, task
 from airflow.providers.common.compat.sdk import TriggerRule
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
@@ -34,21 +34,11 @@ REPO_BASE = os.environ.get("HF_TEST_WRITE_REPO_ID", f"{HUB_ORG}/airflow-provider
 REPO_ID = f"{REPO_BASE}-{SYSTEM_TESTS_ENV_ID}"
 CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_default")
 REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
+PUBLISHED_ASSET = Asset(uri=f"hf://datasets/{REPO_ID}")
 
 
 def keep_columns(example):
     return {"sentence": example["sentence1"], "label": example["label"]}
-
-
-class AssertAssetPushOperator(PushToHubOperator):
-    """Assert that outlet metadata and the publication result agree."""
-
-    def execute(self, context):
-        result = super().execute(context)
-        event = context["outlet_events"][self.published_asset]
-        assert event.extra["commit_sha"] == result["commit_sha"]
-        assert event.extra["commit_url"] == result["commit_url"]
-        return result
 
 
 with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"]) as dag:
@@ -77,7 +67,7 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
         output_uri="file:///tmp/hf-provider-system/write-mapped.json",
         transform=keep_columns,
     )
-    publish = AssertAssetPushOperator(
+    publish = PushToHubOperator(
         task_id="publish_private_dataset",
         input_uri=mapped.output,
         repo_id=REPO_ID,
@@ -85,12 +75,15 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
         huggingface_conn_id=CONN_ID,
     )
 
-    @task
+    @task(inlets=[PUBLISHED_ASSET])
     def verify_xcom_matches_hub_head(publication):
+        context = get_current_context()
+        event = context["inlet_events"][PUBLISHED_ASSET][-1]
         assert publication["commit_sha"]
+        assert event.extra["commit_sha"] == publication["commit_sha"]
         head = HuggingFaceHook(CONN_ID).get_dataset_info(REPO_ID).sha
         assert publication["commit_sha"] == head
-        assert publication["commit_url"].endswith(head)
+        assert event.extra["commit_url"].endswith(head)
 
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def delete_private_repo(created_repo):

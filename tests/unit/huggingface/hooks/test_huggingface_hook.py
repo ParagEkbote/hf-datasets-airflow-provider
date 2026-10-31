@@ -15,6 +15,7 @@
 # specific language governing permissions and limitations
 # under the License.
 """Connection-backed authentication tests for HuggingFaceHook."""
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -22,6 +23,19 @@ import pytest
 from airflow.exceptions import AirflowNotFoundException
 
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
+from huggingface_hub import GitCommitInfo
+
+
+def git_commit_info(commit_id, title, message=""):
+    return GitCommitInfo(
+        commit_id=commit_id,
+        authors=["unit-test"],
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        title=title,
+        message=message,
+        formatted_title=None,
+        formatted_message=None,
+    )
 
 
 @pytest.fixture
@@ -117,8 +131,8 @@ def test_connection_extra_token_is_ignored(monkeypatch):
 
 def test_find_commit_by_marker_matches_title_and_only_returns_final_upload_part():
     marker = "airflow-artifact-sha256:abc:target:def"
-    partial = SimpleNamespace(commit_id="a" * 40, title=f"Publish [{marker}] (part 1-of-2)", message="")
-    final = SimpleNamespace(commit_id="b" * 40, title=f"Publish [{marker}] (part 2-of-2)", message="")
+    partial = git_commit_info("a" * 40, f"Publish [{marker}] (part 1-of-2)")
+    final = git_commit_info("b" * 40, f"Publish [{marker}] (part 2-of-2)")
     with patch("airflow.providers.huggingface.hooks.huggingface.HfApi", autospec=True) as api_type:
         api_type.return_value.list_repo_commits.return_value = [final, partial]
         hook = HuggingFaceHook(None)
@@ -135,7 +149,7 @@ def test_find_commit_by_marker_matches_title_and_only_returns_final_upload_part(
 
 def test_find_commit_by_marker_scans_pull_request_refs_when_requested():
     marker = "huggingface-stream-publish:target"
-    final = SimpleNamespace(commit_id="c" * 40, title=f"Stream [{marker}]", message="")
+    final = git_commit_info("c" * 40, f"Stream [{marker}]")
     with patch("airflow.providers.huggingface.hooks.huggingface.HfApi", autospec=True) as api_type:
         api = api_type.return_value
         api.list_repo_refs.return_value.pull_requests = [SimpleNamespace(ref="refs/pr/7")]
