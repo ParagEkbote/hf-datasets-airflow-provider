@@ -21,9 +21,13 @@ from urllib.parse import SplitResult, urlsplit
 
 
 def sanitize_uri(uri: str | SplitResult) -> str | SplitResult:
-    """Normalize the canonical dataset URI; Airflow passes a SplitResult."""
+    """Normalize dataset URIs and leave other Hub paths unchanged."""
     parsed = uri if isinstance(uri, SplitResult) else urlsplit(uri)
-    if parsed.scheme != "hf" or parsed.netloc != "datasets" or not parsed.path.strip("/"):
+    if parsed.scheme != "hf":
+        raise ValueError(f"Invalid Hugging Face dataset asset URI: {uri}")
+    if parsed.netloc != "datasets":
+        return parsed if isinstance(uri, SplitResult) else uri
+    if not parsed.path.strip("/"):
         raise ValueError(f"Invalid Hugging Face dataset asset URI: {uri}")
     normalized = parsed._replace(
         scheme="hf", netloc="datasets", path=f"/{parsed.path.strip('/')}", query="", fragment=""

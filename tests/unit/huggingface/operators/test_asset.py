@@ -28,6 +28,14 @@ def test_sanitize_dataset_asset_uri_string_and_airflow_split_result():
     assert create_asset(uri).uri == "hf://datasets/org/example"
 
 
-def test_rejects_non_dataset_asset_uri():
+@pytest.mark.parametrize("uri", ["hf://org/model", "hf://spaces/org/app"])
+def test_non_dataset_hub_asset_uris_pass_through(uri):
+    assert sanitize_uri(uri) == uri
+    normalized = sanitize_uri(urlsplit(uri))
+    assert urlunsplit(normalized) == uri
+    assert create_asset(uri).uri == uri
+
+
+def test_rejects_malformed_dataset_asset_uri():
     with pytest.raises(ValueError):
-        sanitize_uri("hf://models/org/example")
+        sanitize_uri("hf://datasets/")
