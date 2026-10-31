@@ -16,10 +16,8 @@
 # under the License.
 """Read a pinned public dataset, map it, and validate the durable XCom handoff."""
 from airflow.sdk import DAG, task
-from airflow.sdk.execution_time.context import get_current_context
 
 from airflow.providers.huggingface.operators.datasets import LoadDatasetOperator, MapDatasetOperator
-from airflow.providers.huggingface.operators.datasets import _load_artifact
 
 SOURCE_REPO = "nyu-mll/glue"
 SOURCE_REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
@@ -47,16 +45,14 @@ with DAG(dag_id="huggingface_system_read_only", tags=["huggingface", "system-tes
     )
 
     @task
-    def verify_xcom_and_artifact(mapped_ref):
-        context = get_current_context()
-        load_ref = context["ti"].xcom_pull(task_ids="load_public_dataset")
+    def verify_xcom_and_artifact(load_ref, mapped_ref):
         assert load_ref["revision"] == SOURCE_REVISION
-        result = _load_artifact(mapped_ref)
-        assert result.num_rows == 8
-        assert "pair_text" in result.column_names
-        return {"revision": load_ref["revision"], "rows": result.num_rows}
+        dataset_ref = mapped_ref["splits"]["dataset"]
+        assert dataset_ref["rows"] == 8
+        assert "pair_text" in dataset_ref["features"]
+        return {"revision": load_ref["revision"], "rows": dataset_ref["rows"]}
 
-    verify_xcom_and_artifact(mapped.output)
+    verify_xcom_and_artifact(load.output, mapped.output)
 
     from tests_common.test_utils.watcher import watcher
 
