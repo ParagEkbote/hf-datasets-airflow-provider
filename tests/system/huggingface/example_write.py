@@ -16,6 +16,7 @@
 # under the License.
 """Publish to a temporary private Hub repo and validate XCom, asset, and Hub head."""
 import os
+import uuid
 
 from airflow.sdk import DAG, task
 from airflow.providers.common.compat.sdk import TriggerRule
@@ -28,8 +29,10 @@ from airflow.providers.huggingface.operators.datasets import (
 )
 
 HUB_ORG = os.environ.get("HF_TEST_HUB_ORG", "configure-org")
-REPO_ID = os.environ.get("HF_TEST_WRITE_REPO_ID", f"{HUB_ORG}/airflow-provider-system-write")
-CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_test")
+SYSTEM_TESTS_ENV_ID = os.environ.get("SYSTEM_TESTS_ENV_ID", uuid.uuid4().hex)
+REPO_BASE = os.environ.get("HF_TEST_WRITE_REPO_ID", f"{HUB_ORG}/airflow-provider-system-write")
+REPO_ID = f"{REPO_BASE}-{SYSTEM_TESTS_ENV_ID}"
+CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_default")
 REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
 
 

@@ -16,6 +16,7 @@
 # under the License.
 """Verify an Airflow 3.3+ retry reuses a successful Hub data commit."""
 import os
+import uuid
 
 import airflow
 import pytest
@@ -35,8 +36,10 @@ pytestmark = pytest.mark.skipif(
     reason="Task state store retry acceptance requires Airflow 3.3+",
 )
 HUB_ORG = os.environ.get("HF_TEST_HUB_ORG", "configure-org")
-REPO_ID = os.environ.get("HF_TEST_DURABLE_REPO_ID", f"{HUB_ORG}/airflow-provider-system-durable")
-CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_test")
+SYSTEM_TESTS_ENV_ID = os.environ.get("SYSTEM_TESTS_ENV_ID", uuid.uuid4().hex)
+REPO_BASE = os.environ.get("HF_TEST_DURABLE_REPO_ID", f"{HUB_ORG}/airflow-provider-system-durable")
+REPO_ID = f"{REPO_BASE}-{SYSTEM_TESTS_ENV_ID}"
+CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_default")
 REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
 
 

@@ -25,7 +25,8 @@ to that deployment's shared location. For object storage, install the matching
 Airflow provider and filesystem dependency, then include the connection ID in
 the URI, for example ``s3://aws_default@bucket/path/data.json`` or
 ``gs://google_cloud_default@bucket/path/data.json``. A bare remote URI uses the
-filesystem's default credential chain. Operators exchange compact references
+filesystem's default credential chain; creating an Airflow connection alone
+does not select it. Operators exchange compact references
 through XCom, never dataset contents. The streaming publisher sends the
 ``IterableDataset`` directly to the Hub and returns only commit metadata.
 

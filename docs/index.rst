@@ -57,7 +57,8 @@ Guides
 The system-test DAGs under ``tests/system/huggingface/`` also serve as runnable
 examples. The read-only workflow uses a pinned public dataset. The publication
 workflows require ``HF_TEST_HUB_ORG`` for a dedicated organization and
-``HF_TEST_HUB_CONN_ID`` (or ``huggingface_default``) for a write-scoped
+``HF_TEST_HUB_CONN_ID`` (defaults to ``huggingface_default``) for a write-scoped
 connection. ``HF_TEST_WRITE_REPO_ID`` and ``HF_TEST_DURABLE_REPO_ID`` can
-override the temporary repository names. Cleanup tasks use ``ALL_DONE`` so
-they are attempted after failures.
+override the base repository names. Each run appends ``SYSTEM_TESTS_ENV_ID``
+(or a generated UUID) to its repository name to avoid collisions. Cleanup tasks
+use ``ALL_DONE`` so they are attempted after failures.
