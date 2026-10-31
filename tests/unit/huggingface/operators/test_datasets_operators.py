@@ -15,7 +15,8 @@
 # specific language governing permissions and limitations
 # under the License.
 """Regression coverage for durable load/map/publish behavior."""
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 from datasets import ClassLabel, Dataset, DatasetDict, Features, Image, Value
@@ -91,92 +92,69 @@ def test_non_hub_load_does_not_resolve_hub_revision(tmp_path):
     assert result["revision"] is None
 
 
-def test_stream_operator_resolves_revision_and_enforces_both_bounds(tmp_path):
-    rows = [{"value": value} for value in range(1, 10)]
+def test_stream_operator_lazily_transforms_filters_and_publishes_with_asset_event():
+    transformed = lambda row, increment: {"value": row["value"] + increment}
+    predicate = lambda row: row["value"] > 1
+    stream = MagicMock()
+    stream.map.return_value = stream
+    stream.filter.return_value = stream
+    commit = commit_info("org/streamed", message="Stream dataset from Airflow")
     with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
         hook = hook_type.return_value
         hook.get_dataset_info.return_value.sha = "pinned-stream-sha"
-        hook.load_dataset.return_value = iter(rows)
+        hook.load_dataset.return_value = stream
+        hook.find_commit_by_marker.return_value = None
+        hook.push_to_hub.return_value = commit
         operator = StreamDatasetOperator(
             task_id="stream",
-            path="org/data",
+            path="org/source",
             split="train",
             revision="main",
-            output_uri=(tmp_path / "stream.json").as_uri(),
-            max_source_rows=5,
-            max_output_rows=2,
-            transform=lambda row, increment: {"value": row["value"] + increment},
+            repo_id="org/streamed",
+            config="clean",
+            private=True,
+            transform=transformed,
             transform_kwargs={"increment": 1},
-            predicate=lambda row: row["value"] % 2 == 0,
-            feature_types={"value": "int64"},
+            predicate=predicate,
             huggingface_conn_id=None,
         )
-        reference = operator.execute({})
+        event = SimpleNamespace(extra=None)
+        result = operator.execute({"run_id": "scheduled__2026-10-31", "outlet_events": {operator.published_asset: event}})
 
-    hook.get_dataset_info.assert_called_once_with("org/data", "main")
+    hook.get_dataset_info.assert_called_once_with("org/source", "main")
     hook.load_dataset.assert_called_once_with(
-        "org/data", streaming=True, split="train", revision="pinned-stream-sha"
+        "org/source", streaming=True, split="train", revision="pinned-stream-sha"
     )
-    dataset = _load_artifact(reference)
-    assert dataset["value"] == [2, 4]
-    assert dataset.features["value"].dtype == "int64"
-    assert reference["revision"] == "pinned-stream-sha"
-    assert reference["source_rows_examined"] == 3
-    assert reference["streaming"] is True
+    hook.push_to_hub.assert_called_once()
+    stream.map.assert_called_once_with(transformed, fn_kwargs={"increment": 1})
+    stream.filter.assert_called_once_with(predicate)
+    assert hook.push_to_hub.call_args.args == (stream, "org/streamed")
+    push_kwargs = hook.push_to_hub.call_args.kwargs
+    assert push_kwargs["config_name"] == "clean"
+    assert push_kwargs["private"] is True
+    assert "huggingface-stream-publish:" in push_kwargs["commit_message"]
+    assert result["source_revision"] == "pinned-stream-sha"
+    assert result["commit_sha"] == commit.oid
+    assert result["streaming"] is True
+    assert event.extra["commit_sha"] == commit.oid
 
 
-def test_stream_operator_preserves_split_names_for_unspecified_split(tmp_path):
+def test_stream_operator_recovers_prior_commit_without_reloading_stream():
+    commit = commit_info("org/streamed")
     with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
         hook = hook_type.return_value
-        hook.load_dataset.return_value = {
-            "train": iter([{"value": 1}, {"value": 2}]),
-            "validation": iter([{"value": 3}]),
-        }
+        hook.find_commit_by_marker.return_value = commit
         operator = StreamDatasetOperator(
-            task_id="stream_splits",
+            task_id="stream",
             path="csv",
-            output_uri=(tmp_path / "splits.json").as_uri(),
-            max_source_rows=3,
-            max_output_rows=3,
-            transform=lambda row: row,
+            repo_id="org/streamed",
             huggingface_conn_id=None,
         )
-        reference = operator.execute({})
+        result = operator.execute({"run_id": "scheduled__2026-10-31"})
 
-    dataset = _load_artifact(reference)
-    assert list(dataset) == ["train", "validation"]
-    assert dataset["train"]["value"] == [1, 2]
-    assert dataset["validation"]["value"] == [3]
-
-
-@pytest.mark.parametrize("limit", [0, -1])
-def test_stream_operator_requires_positive_row_bounds(tmp_path, limit):
-    with pytest.raises(ValueError, match="row bounds must be positive"):
-        StreamDatasetOperator(
-            task_id="invalid_stream",
-            path="csv",
-            output_uri=(tmp_path / "invalid.json").as_uri(),
-            max_source_rows=limit,
-            max_output_rows=1,
-            transform=lambda row: row,
-        )
-
-
-def test_stream_operator_fails_when_no_rows_pass_the_filter(tmp_path):
-    with patch("airflow.providers.huggingface.operators.datasets.HuggingFaceHook") as hook_type:
-        hook_type.return_value.load_dataset.return_value = iter([{"value": 1}, {"value": 2}])
-        operator = StreamDatasetOperator(
-            task_id="empty_stream",
-            path="csv",
-            output_uri=(tmp_path / "empty.json").as_uri(),
-            max_source_rows=2,
-            max_output_rows=2,
-            transform=lambda row: row,
-            predicate=lambda row: False,
-            huggingface_conn_id=None,
-        )
-        with pytest.raises(ValueError, match="No streaming rows"):
-            operator.execute({})
+    hook.load_dataset.assert_not_called()
+    hook.push_to_hub.assert_not_called()
+    assert result["commit_sha"] == commit.oid
 
 
 def test_parquet_manifest_preserves_order_features_and_dataset_splits(tmp_path):

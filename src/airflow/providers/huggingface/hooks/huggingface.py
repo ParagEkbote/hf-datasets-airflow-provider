@@ -82,7 +82,10 @@ class HuggingFaceHook(BaseHook):
 
     def find_publication_commit(self, repo_id: str, fingerprint: str) -> Any | None:
         """Find a prior commit for this artifact after a worker crash."""
-        marker = f"airflow-artifact-sha256:{fingerprint}"
+        return self.find_commit_by_marker(repo_id, f"airflow-artifact-sha256:{fingerprint}")
+
+    def find_commit_by_marker(self, repo_id: str, marker: str) -> Any | None:
+        """Find a prior dataset commit containing a caller-provided marker."""
         try:
             commits = self.get_conn().list_repo_commits(repo_id, repo_type="dataset")
         except RepositoryNotFoundError:

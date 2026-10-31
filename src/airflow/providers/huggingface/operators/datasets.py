@@ -251,41 +251,48 @@ class LoadDatasetOperator(BaseOperator):
 
 
 class StreamDatasetOperator(BaseOperator):
-    """Read a bounded streaming sample, transform/filter rows, and persist it."""
+    """Transform a streamed dataset lazily and publish it directly to the Hub."""
 
-    template_fields = ("path", "name", "split", "revision", "output_uri", "transform_kwargs")
+    template_fields = ("path", "name", "split", "revision", "config", "commit_message")
 
     def __init__(
         self,
         *,
         path: str,
-        output_uri: str,
-        max_source_rows: int,
-        max_output_rows: int,
-        transform: Callable[..., dict[str, Any]],
+        repo_id: str,
+        transform: Callable[..., dict[str, Any]] | None = None,
+        predicate: Callable[[dict[str, Any]], bool] | None = None,
         name: str | None = None,
         split: str | None = None,
         revision: str | None = None,
-        predicate: Callable[..., bool] | None = None,
+        config: str | None = None,
+        private: bool | None = None,
+        commit_message: str | None = None,
         transform_kwargs: dict[str, Any] | None = None,
-        feature_types: dict[str, str] | None = None,
+        push_kwargs: dict[str, Any] | None = None,
         huggingface_conn_id: str | None = "huggingface_default",
         **kwargs: Any,
     ) -> None:
-        super().__init__(**kwargs)
-        if max_source_rows <= 0 or max_output_rows <= 0:
-            raise ValueError("Streaming row bounds must be positive")
-        if not callable(transform):
-            raise TypeError("transform must be a callable")
+        if "{{" in repo_id:
+            raise ValueError("repo_id cannot be templated: it defines the Asset that downstream DAGs schedule on.")
+        if transform is not None and not callable(transform):
+            raise TypeError("transform must be a callable or None")
         if predicate is not None and not callable(predicate):
             raise TypeError("predicate must be a callable or None")
-        self.path, self.output_uri = path, output_uri
-        self.max_source_rows, self.max_output_rows = max_source_rows, max_output_rows
+        self.path, self.repo_id = path, repo_id
         self.transform, self.predicate = transform, predicate
         self.name, self.split, self.revision = name, split, revision
+        self.config, self.private, self.commit_message = config, private, commit_message
         self.transform_kwargs = transform_kwargs or {}
-        self.feature_types = feature_types or {}
+        self.push_kwargs = push_kwargs or {}
         self.huggingface_conn_id = huggingface_conn_id
+        self.published_asset = Asset(uri=f"hf://datasets/{repo_id}")
+        user_outlets = kwargs.pop("outlets", None)
+        if user_outlets is None:
+            user_outlets = []
+        elif not isinstance(user_outlets, (list, tuple)):
+            user_outlets = [user_outlets]
+        super().__init__(outlets=[*user_outlets, self.published_asset], **kwargs)
 
     def execute(self, context: dict[str, Any]) -> dict[str, Any]:
         hook = HuggingFaceHook(self.huggingface_conn_id)
@@ -294,56 +301,68 @@ class StreamDatasetOperator(BaseOperator):
         if is_hub_repo:
             revision = hook.get_dataset_info(self.path, revision).sha
 
-        kwargs: dict[str, Any] = {"streaming": True}
-        if self.name is not None:
-            kwargs["name"] = self.name
-        if self.split is not None:
-            kwargs["split"] = self.split
-        if revision is not None:
-            kwargs["revision"] = revision
-        stream = hook.load_dataset(self.path, **kwargs)
+        ti = context.get("ti") or context.get("task_instance")
+        run_id = context.get("run_id") or getattr(ti, "run_id", "manual")
+        marker = _task_key(context, "stream-publish", f"{self.repo_id}:{run_id}")
+        commit = hook.find_commit_by_marker(self.repo_id, marker)
 
-        rows_by_split: dict[str, list[dict[str, Any]]] = {}
-        examined = 0
-        streams = stream.items() if isinstance(stream, dict) else [("dataset", stream)]
-        output_count = 0
-        for split_name, split_stream in streams:
-            split_rows: list[dict[str, Any]] = []
-            iterator = iter(split_stream)
-            while examined < self.max_source_rows and output_count < self.max_output_rows:
-                try:
-                    row = next(iterator)
-                except StopIteration:
-                    break
-                examined += 1
-                transformed = self.transform(row, **self.transform_kwargs)
-                if not isinstance(transformed, dict):
-                    raise TypeError("stream transform must return a dict")
-                if self.predicate is None or self.predicate(transformed):
-                    split_rows.append(transformed)
-                    output_count += 1
-            if split_rows:
-                rows_by_split[str(split_name)] = split_rows
-            if examined >= self.max_source_rows or output_count >= self.max_output_rows:
-                break
-        if not rows_by_split:
-            raise ValueError("No streaming rows passed the configured bounds and filter")
+        if commit is None:
+            load_kwargs: dict[str, Any] = {"streaming": True}
+            if self.name is not None:
+                load_kwargs["name"] = self.name
+            if self.split is not None:
+                load_kwargs["split"] = self.split
+            if revision is not None:
+                load_kwargs["revision"] = revision
+            stream = hook.load_dataset(self.path, **load_kwargs)
 
-        features = Features({key: Value(kind) for key, kind in self.feature_types.items()}) if self.feature_types else None
-        parts = {
-            name: Dataset.from_list(rows, features=features)
-            for name, rows in rows_by_split.items()
-        }
-        dataset = parts["dataset"] if list(parts) == ["dataset"] else DatasetDict(parts)
-        metadata = {
-            "repository_id": self.path if is_hub_repo else None,
-            "revision": revision,
+            if self.transform is not None:
+                stream = stream.map(self.transform, fn_kwargs=self.transform_kwargs)
+            if self.predicate is not None:
+                stream = stream.filter(self.predicate)
+
+            push_kwargs = dict(self.push_kwargs)
+            if self.config is not None:
+                push_kwargs["config_name"] = self.config
+            if self.private is not None:
+                push_kwargs["private"] = self.private
+            message = self.commit_message or "Stream dataset from Airflow"
+            push_kwargs["commit_message"] = f"{message} [{marker}]"
+            commit = hook.push_to_hub(stream, self.repo_id, **push_kwargs)
+            # A retry can recover the completed Hub commit if the worker exited
+            # after upload but before Airflow recorded the task result.
+            if commit is None:
+                commit = hook.find_commit_by_marker(self.repo_id, marker)
+
+        commit_sha = getattr(commit, "oid", None)
+        commit_url = getattr(commit, "commit_url", None)
+        if commit_sha is None:
+            commit_sha = hook.get_dataset_info(self.repo_id).sha
+        if commit_url is None:
+            commit_url = f"https://huggingface.co/datasets/{self.repo_id}/commit/{commit_sha}"
+        result = {
+            "repository_id": self.repo_id,
+            "commit_sha": commit_sha,
+            "commit_url": commit_url,
+            "url": f"https://huggingface.co/datasets/{self.repo_id}",
+            "source_repository_id": self.path if is_hub_repo else None,
+            "source_revision": revision,
             "configuration": self.name,
             "split": self.split,
             "streaming": True,
-            "source_rows_examined": examined,
         }
-        return _save(dataset, self.output_uri, metadata)
+        self._emit_asset_event(context, result)
+        return result
+
+    def _emit_asset_event(self, context: dict[str, Any], publication: dict[str, Any]) -> None:
+        events = context.get("outlet_events")
+        if events is not None:
+            events[self.published_asset].extra = {
+                "repository_id": self.repo_id,
+                "commit_sha": publication["commit_sha"],
+                "commit_url": publication["commit_url"],
+                "source_revision": publication["source_revision"],
+            }
 
 
 class MapDatasetOperator(BaseOperator):

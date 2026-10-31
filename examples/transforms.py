@@ -47,13 +47,3 @@ def add_char_count(batch: dict) -> dict:
 def keep_long_outputs(example: dict) -> bool:
     """Keep rows whose output is longer than 200 characters (Dataset.filter)."""
     return len(example["output"]) > 200
-
-
-def clean_fineweb_document(example: dict) -> dict:
-    """Normalize a FineWeb document and add a word count."""
-    text = " ".join(example["text"].split())
-    return {"text": text, "word_count": len(text.split())}
-
-
-def is_long_fineweb_document(example: dict) -> bool:
-    return example["word_count"] >= 100

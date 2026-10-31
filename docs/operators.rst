@@ -34,16 +34,51 @@ preserves compatible provenance and records a new artifact fingerprint.
 StreamDatasetOperator
 ---------------------
 
-``StreamDatasetOperator`` loads with Datasets ``streaming=True`` and requires
-positive ``max_source_rows`` and ``max_output_rows`` bounds. It applies a
-Python ``transform`` to each row and can optionally apply a Python ``predicate``
-to each transformed row. Both callables must be available at DAG parse time and
-on workers. ``transform_kwargs`` are passed to the transform. ``feature_types``
-can declare a ``Features`` schema for the materialized sample. The selected
-bounded rows are persisted through the same manifest and per-split Parquet
-artifact contract as load and map tasks; dataset rows are never put in XCom.
-An empty result fails the task. The resulting feature types must be supported
-by the Parquet artifact writer.
+Hugging Face Datasets ``streaming=True`` returns an ``IterableDataset`` (or an
+iterable of splits) that reads examples incrementally. It avoids materializing
+the full source dataset and is intended for sequential iteration; it does not
+provide the usual in-memory ``Dataset`` behavior such as random access.
+
+``StreamDatasetOperator`` loads with
+``streaming=True``, applies the optional ``transform`` with
+``transform_kwargs``, then applies the optional ``predicate`` using Datasets'
+lazy iterable operations. It passes the resulting ``IterableDataset`` or
+``IterableDatasetDict`` directly to ``push_to_hub`` in the same task. Datasets
+progressively writes Parquet shards to the Hub, so rows are not accumulated in
+a Python list, stored in XCom, or written to a local artifact first.
+
+The operator accepts ``path``, ``repo_id``, optional ``name``, ``split``,
+``revision``, ``config``, ``private``, ``commit_message``,
+``huggingface_conn_id``, and ``push_kwargs``. It returns the Hub repository,
+commit SHA and URL, source revision, configuration, split, and
+``streaming=True``. After a successful push it emits the matching
+``hf://datasets/<repo_id>`` asset event. A run marker in the commit message
+lets a retry recover a completed push if the worker exited before Airflow
+recorded the result.
+
+Unlike the local Parquet artifact path, this operator delegates feature
+serialization to Datasets' Hub upload implementation and does not use the
+provider's ``_validate_feature`` whitelist. It does not create a local manifest
+reference for downstream ``MapDatasetOperator`` or ``PushToHubOperator`` tasks;
+downstream tasks should load the published Hub repository. Passing
+``streaming=True`` through ``LoadDatasetOperator.load_kwargs`` is not a
+substitute: that operator writes a durable artifact and its writer accepts
+``Dataset`` and ``DatasetDict``, not ``IterableDataset``.
+
+For example:
+
+.. code-block:: python
+
+   from airflow.providers.huggingface.operators.datasets import StreamDatasetOperator
+
+   publish_stream = StreamDatasetOperator(
+       task_id="publish_stream",
+       path="cornell-movie-review-data/rotten_tomatoes",
+       split="train",
+       repo_id="my-org/rotten-tomatoes-clean",
+       transform=normalize_review,
+       predicate=keep_nonempty_review,
+   )
 
 PushToHubOperator
 -----------------

@@ -2,7 +2,7 @@
 
 ![Hero Img](<docs/images/Apache Airflow ❤️ Hugging Face Datasets.png>)
 
-Apache Airflow provider with operators to load, transform, and publish Hugging Face Datasets.
+Apache Airflow provider with operators to load, transform, stream, and publish Hugging Face Datasets.
 
 ## Compatibility
 
@@ -47,6 +47,8 @@ with DAG("hf_dataset_pipeline") as dag:
 `my_project.transforms.normalize` must be importable wherever the DAG is parsed and on the task worker, and accept the Datasets map function signature. Large transformations execute in worker processes and need sufficient memory and disk. No dataset operation runs while parsing the DAG.
 
 `PushToHubOperator` publishes the dataset through `Dataset.push_to_hub`, which updates the Hub repository README's YAML card metadata (including `dataset_info` and `configs`) in the push commit. The operator publishes data and lets Datasets update that metadata; it does not author dataset card content such as the README description or usage sections.
+
+For a streaming pipeline, use `StreamDatasetOperator`. It applies transformations and filters lazily to an `IterableDataset` and progressively publishes the result to the Hub in one task, without building a Python list or an intermediate artifact. Use `LoadDatasetOperator` and `MapDatasetOperator` for durable local or object-storage artifacts.
 
 ## Examples
 
