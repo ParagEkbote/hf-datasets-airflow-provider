@@ -63,7 +63,7 @@ def get_provider_info() -> dict:
                 "schemes": ["hf"],
                 "factory": "airflow.providers.huggingface.asset.create_asset",
                 "handler": "airflow.providers.huggingface.asset.sanitize_uri",
-                "to_openlineage_converter": "airflow.providers.huggingface.asset.to_openlineage_dataset",
+                "to_openlineage_converter": "airflow.providers.huggingface.asset.convert_asset_to_openlineage",
             }
         ],
     }

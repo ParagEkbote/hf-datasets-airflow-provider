@@ -17,7 +17,12 @@
 import pytest
 from urllib.parse import urlsplit, urlunsplit
 
-from airflow.providers.huggingface.asset import create_asset, sanitize_uri
+from airflow.providers.common.compat.openlineage.facet import Dataset
+from airflow.providers.huggingface.asset import (
+    convert_asset_to_openlineage,
+    create_asset,
+    sanitize_uri,
+)
 
 
 def test_sanitize_dataset_asset_uri_string_and_airflow_split_result():
@@ -25,7 +30,8 @@ def test_sanitize_dataset_asset_uri_string_and_airflow_split_result():
     assert sanitize_uri(uri) == "hf://datasets/org/example"
     normalized = sanitize_uri(urlsplit(uri))
     assert urlunsplit(normalized) == "hf://datasets/org/example"
-    assert create_asset(uri).uri == "hf://datasets/org/example"
+    asset = create_asset(repo_id="org/example", extra={"source": "test"})
+    assert asset.uri == "hf://datasets/org/example"
 
 
 @pytest.mark.parametrize("uri", ["hf://org/model", "hf://spaces/org/app"])
@@ -33,7 +39,20 @@ def test_non_dataset_hub_asset_uris_pass_through(uri):
     assert sanitize_uri(uri) == uri
     normalized = sanitize_uri(urlsplit(uri))
     assert urlunsplit(normalized) == uri
-    assert create_asset(uri).uri == uri
+
+
+def test_airflow_asset_factory_and_openlineage_converter_signatures():
+    extra = {"owner": "unit-test"}
+    asset_kwargs = {"repo_id": "org/example"}
+    asset = create_asset(**asset_kwargs, extra=extra)
+    assert asset.uri == "hf://datasets/org/example"
+    assert asset.extra == extra
+
+    lineage_context = object()
+    converted = convert_asset_to_openlineage(asset, lineage_context)
+    assert isinstance(converted, Dataset)
+    assert converted.namespace == "https://huggingface.co"
+    assert converted.name == "datasets/org/example"
 
 
 def test_rejects_malformed_dataset_asset_uri():

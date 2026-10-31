@@ -18,8 +18,9 @@ only by provider hooks during task execution. Publication targets use `my-org/..
 Where an example sets ``revision``, it pins the source to a commit SHA; review
 those revisions when updating examples.
 
-Examples that create durable artifacts write under `/tmp/hf-datasets`. This
-works for a single-worker tutorial. Multi-worker deployments need a shared
+Examples that create durable artifacts write under
+`/tmp/hf-datasets/<dag_id>/<run_id>/`. The templated path keeps overlapping DAG
+runs from overwriting one another. Multi-worker deployments need a shared
 writable filesystem at the same path on each worker; change the `file://` URIs
 to that deployment's shared location. For object storage, install the matching
 Airflow provider and filesystem dependency, then include the connection ID in
@@ -51,8 +52,9 @@ the event-driven flow.
 
 ## Expected outputs
 
-* **GLUE MRPC:** `file:///tmp/hf-datasets/mrpc_normalized.json`, with `text` and `label`
-  columns, followed by publication to the configured Hub repository.
+* **GLUE MRPC:** a run-specific
+  `file:///tmp/hf-datasets/<dag_id>/<run_id>/mrpc_normalized.json`, with `text`
+  and `label` columns, followed by publication to the configured Hub repository.
 * **Rotten Tomatoes streaming:** the train split is transformed and filtered lazily, then published progressively to the configured Hub repository without a local artifact.
 * **SQuAD:** train and validation are mapped together and published as a DatasetDict.
 * **Daily refresh:** successful publication emits `hf://datasets/<HF_PRODUCER_REPO_ID>`.

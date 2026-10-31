@@ -38,15 +38,18 @@ def sanitize_uri(uri: str | SplitResult) -> str | SplitResult:
     return urlunsplit(normalized)
 
 
-def create_asset(uri: str):
+def create_asset(*, repo_id: str, extra: dict | None = None):
+    """Build a dataset asset from the repo ID supplied by Airflow's URI factory."""
     try:
         from airflow.sdk import Asset
     except ImportError:
         from airflow.datasets import Dataset as Asset
-    return Asset(uri=sanitize_uri(uri))
+    return Asset(uri=sanitize_uri(f"hf://datasets/{repo_id}"), extra=extra)
 
 
-def to_openlineage_dataset(uri: str, **kwargs):
-    from openlineage.client import Dataset
-    canonical = sanitize_uri(uri)
+def convert_asset_to_openlineage(asset, lineage_context):
+    """Convert an Airflow Hugging Face dataset asset to an OpenLineage dataset."""
+    from airflow.providers.common.compat.openlineage.facet import Dataset
+
+    canonical = sanitize_uri(asset.uri)
     return Dataset(namespace="https://huggingface.co", name=canonical.removeprefix("hf://"), facets={})

@@ -133,11 +133,11 @@ Example
 
    load = LoadDatasetOperator(
        task_id="load", path="nyu-mll/glue", name="mrpc", split="train",
-       revision="<commit-sha>", output_uri="s3://airflow/data/mrpc.json",
+       revision="<commit-sha>", output_uri="s3://airflow/data/{{ dag_id }}/{{ run_id }}/mrpc.json",
    )
    transform = MapDatasetOperator(
        task_id="normalize", input_uri=load.output,
-       output_uri="s3://airflow/data/mrpc-normalized.json", transform=normalize,
+       output_uri="s3://airflow/data/{{ dag_id }}/{{ run_id }}/mrpc-normalized.json", transform=normalize,
    )
    publish = PushToHubOperator(
        task_id="publish", input_uri=transform.output,
