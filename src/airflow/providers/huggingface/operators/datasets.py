@@ -32,9 +32,9 @@ from airflow.providers.common.compat.sdk import Asset, BaseOperator, Context, Ob
 from airflow.providers.huggingface.hooks.huggingface import HuggingFaceHook
 
 
-def _path(uri: str) -> ObjectStoragePath:
+def _path(uri: str, *, conn_id: str | None = None) -> ObjectStoragePath:
     """Resolve a URI through Airflow's configured object-storage filesystems."""
-    return ObjectStoragePath(uri)
+    return ObjectStoragePath(uri, conn_id=conn_id)
 
 
 def _reference(reference: str | dict[str, Any]) -> str:
@@ -48,9 +48,9 @@ def _reference(reference: str | dict[str, Any]) -> str:
     return reference
 
 
-def _sha256_path(uri: str) -> str:
+def _sha256_path(uri: str, *, conn_id: str | None = None) -> str:
     digest = hashlib.sha256()
-    with _path(uri).open("rb") as stream:
+    with _path(uri, conn_id=conn_id).open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -89,18 +89,20 @@ def _save(
     dataset: Dataset | DatasetDict,
     uri: str,
     metadata: dict[str, Any] | None = None,
+    *,
+    storage_conn_id: str | None = None,
 ) -> dict[str, Any]:
     """Write split Parquet objects and a JSON manifest through ObjectStoragePath."""
     parts = _dataset_parts(dataset)
     written: list[ObjectStoragePath] = []
-    manifest_path = _path(uri)
+    manifest_path = _path(uri, conn_id=storage_conn_id)
     split_manifest: dict[str, Any] = {}
     try:
         for index, (name, part) in enumerate(parts):
             for field_name, feature in part.features.items():
                 _validate_feature(feature, field_name)
             split_uri = f"{uri}.split-{index:05d}.parquet"
-            split_path = _path(split_uri)
+            split_path = _path(split_uri, conn_id=storage_conn_id)
             split_path.parent.mkdir(parents=True, exist_ok=True)
             with split_path.open("wb") as stream:
                 parquet.write_table(part.data.table, stream)
@@ -115,7 +117,7 @@ def _save(
                     if getattr(part, "split", None) is not None
                     else (name if name != "dataset" else None)
                 ),
-                "sha256": _sha256_path(split_uri),
+                "sha256": _sha256_path(split_uri, conn_id=storage_conn_id),
             }
 
         manifest = {
@@ -157,9 +159,11 @@ def _save(
         raise
 
 
-def _read_artifact_manifest(reference: str | dict[str, Any]) -> tuple[str, dict[str, Any]]:
+def _read_artifact_manifest(
+    reference: str | dict[str, Any], *, storage_conn_id: str | None = None
+) -> tuple[str, dict[str, Any]]:
     uri = _reference(reference)
-    manifest_path = _path(uri)
+    manifest_path = _path(uri, conn_id=storage_conn_id)
     with manifest_path.open("rb") as stream:
         manifest_bytes = stream.read()
     if isinstance(reference, dict) and reference.get("fingerprint"):
@@ -178,8 +182,13 @@ def _load_artifact(
     *,
     cache_dir: str | None = None,
     manifest: dict[str, Any] | None = None,
+    storage_conn_id: str | None = None,
 ) -> Dataset | DatasetDict:
-    uri, manifest = _read_artifact_manifest(reference) if manifest is None else (_reference(reference), manifest)
+    uri, manifest = (
+        _read_artifact_manifest(reference, storage_conn_id=storage_conn_id)
+        if manifest is None
+        else (_reference(reference), manifest)
+    )
     resolved_cache_dir = cache_dir or str(Path(tempfile.gettempdir()) / "airflow-hf-datasets-cache")
     Path(resolved_cache_dir).mkdir(parents=True, exist_ok=True)
     parts: dict[str, Dataset] = {}
@@ -188,7 +197,7 @@ def _load_artifact(
             split_uri = item["uri"]
             local_path = Path(local_dir) / f"split-{index:05d}.parquet"
             digest = hashlib.sha256()
-            with _path(split_uri).open("rb") as source, local_path.open("wb") as target:
+            with _path(split_uri, conn_id=storage_conn_id).open("rb") as source, local_path.open("wb") as target:
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
                     digest.update(chunk)
                     target.write(chunk)
@@ -252,6 +261,7 @@ class LoadDatasetOperator(BaseOperator):
         split: str | None = None,
         revision: str | None = None,
         cache_dir: str | None = None,
+        storage_conn_id: str | None = None,
         download_mode: str = "reuse_dataset_if_exists",
         huggingface_conn_id: str | None = "huggingface_default",
         load_kwargs: dict[str, Any] | None = None,
@@ -261,6 +271,7 @@ class LoadDatasetOperator(BaseOperator):
         super().__init__(**kwargs)
         self.path, self.output_uri, self.name, self.split = path, output_uri, name, split
         self.revision, self.cache_dir, self.download_mode = revision, cache_dir, download_mode
+        self.storage_conn_id = storage_conn_id
         self.huggingface_conn_id, self.load_kwargs = huggingface_conn_id, load_kwargs or {}
         self.durable = durable
 
@@ -298,7 +309,7 @@ class LoadDatasetOperator(BaseOperator):
             "configuration": self.name,
             "split": self.split,
         }
-        return _save(dataset, self.output_uri, metadata)
+        return _save(dataset, self.output_uri, metadata, storage_conn_id=self.storage_conn_id)
 
 
 class StreamDatasetOperator(BaseOperator):
@@ -483,6 +494,7 @@ class MapDatasetOperator(BaseOperator):
         transform_kwargs: dict[str, Any] | None = None,
         map_kwargs: dict[str, Any] | None = None,
         cache_dir: str | None = None,
+        storage_conn_id: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -491,9 +503,12 @@ class MapDatasetOperator(BaseOperator):
         self.input_uri, self.output_uri, self.transform = input_uri, output_uri, transform
         self.transform_kwargs, self.map_kwargs = transform_kwargs or {}, map_kwargs or {}
         self.cache_dir = cache_dir
+        self.storage_conn_id = storage_conn_id
 
     def execute(self, context: Context) -> dict[str, Any]:
-        dataset = _load_artifact(self.input_uri, cache_dir=self.cache_dir)
+        dataset = _load_artifact(
+            self.input_uri, cache_dir=self.cache_dir, storage_conn_id=self.storage_conn_id
+        )
         mapped = dataset.map(self.transform, fn_kwargs=self.transform_kwargs, **self.map_kwargs)
         source = self.input_uri if isinstance(self.input_uri, dict) else {}
         provenance = {
@@ -501,7 +516,7 @@ class MapDatasetOperator(BaseOperator):
             for key in ("repository_id", "revision", "configuration", "split")
             if key in source
         }
-        return _save(mapped, self.output_uri, provenance)
+        return _save(mapped, self.output_uri, provenance, storage_conn_id=self.storage_conn_id)
 
 
 class PushToHubOperator(BaseOperator):
@@ -518,6 +533,7 @@ class PushToHubOperator(BaseOperator):
         private: bool | None = None,
         commit_message: str | None = None,
         huggingface_conn_id: str | None = "huggingface_default",
+        storage_conn_id: str | None = None,
         push_kwargs: dict[str, Any] | None = None,
         durable: bool = True,
         **kwargs: Any,
@@ -527,6 +543,7 @@ class PushToHubOperator(BaseOperator):
         self.input_uri, self.repo_id, self.config = input_uri, repo_id, config
         self.private, self.commit_message = private, commit_message
         self.huggingface_conn_id, self.push_kwargs = huggingface_conn_id, push_kwargs or {}
+        self.storage_conn_id = storage_conn_id
         self.durable = durable
         self.published_asset = Asset(uri=f"hf://datasets/{repo_id}")
         user_outlets = kwargs.pop("outlets", None)
@@ -580,7 +597,7 @@ class PushToHubOperator(BaseOperator):
             if commit is not None:
                 self.log.info("Reusing existing completed publication to %s", self.repo_id)
         if commit is None:
-            dataset = _load_artifact(self.input_uri)
+            dataset = _load_artifact(self.input_uri, storage_conn_id=self.storage_conn_id)
             message = self.commit_message or "Publish dataset from Airflow"
             kwargs["commit_message"] = f"{message} [{marker}]"
             commit = hook.push_to_hub(dataset, self.repo_id, **kwargs)

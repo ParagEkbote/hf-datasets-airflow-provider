@@ -11,7 +11,10 @@ LoadDatasetOperator
 
 ``LoadDatasetOperator`` accepts ``path``, ``output_uri``, optional ``name``
 (dataset configuration), ``split``, ``revision``, ``cache_dir``,
-``download_mode``, ``load_kwargs``, and ``durable`` (default ``True``). It
+``download_mode``, ``load_kwargs``, ``storage_conn_id``, and ``durable``
+(default ``True``). ``storage_conn_id`` selects the Airflow object-storage
+connection for ``output_uri``; if omitted, a connection ID in the URI's
+user-info section or the backend's default credentials are used. It
 persists the result and returns the
 artifact URI plus source ID, resolved revision, configuration, split, row
 counts, and feature descriptions. It resolves a Hub source to a commit before
@@ -36,6 +39,8 @@ when the task worker executes. The operator does not template or import the
 callable from a string. ``transform_kwargs`` are passed as Datasets ``fn_kwargs``;
 ``map_kwargs`` are passed to ``Dataset.map`` or ``DatasetDict.map``. The output
 preserves compatible provenance and records a new artifact fingerprint.
+``storage_conn_id`` selects the connection used for both input and output
+artifact paths.
 
 StreamDatasetOperator
 ---------------------
@@ -95,7 +100,9 @@ PushToHubOperator
 
 Required parameters are ``input_uri`` (the full artifact reference, including
 fingerprint) and ``repo_id``. ``config``, ``private``, ``commit_message``,
-``huggingface_conn_id``, and ``push_kwargs`` configure publication. The
+``huggingface_conn_id``, ``storage_conn_id``, and ``push_kwargs`` configure
+publication. ``storage_conn_id`` selects the connection used to read the
+artifact. The
 operator accepts ``durable`` (default ``True``) in addition to its publication
 options. It verifies the manifest fingerprint and per-split checksums before
 uploading. With durability enabled it checks Airflow task state and the target
@@ -134,13 +141,16 @@ Example
    load = LoadDatasetOperator(
        task_id="load", path="nyu-mll/glue", name="mrpc", split="train",
        revision="<commit-sha>", output_uri="s3://airflow/data/{{ dag_id }}/{{ run_id }}/mrpc.json",
+       storage_conn_id="aws_default",
    )
    transform = MapDatasetOperator(
        task_id="normalize", input_uri=load.output,
        output_uri="s3://airflow/data/{{ dag_id }}/{{ run_id }}/mrpc-normalized.json", transform=normalize,
+       storage_conn_id="aws_default",
    )
    publish = PushToHubOperator(
        task_id="publish", input_uri=transform.output,
        repo_id="my-org/mrpc-normalized",
+       storage_conn_id="aws_default",
    )
    load >> transform >> publish

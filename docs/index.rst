@@ -37,10 +37,11 @@ Install into an Airflow environment with Python 3.10 through 3.13:
 The provider requires Apache Airflow 3.0 or later, ``datasets>=3.4.0,<5``,
 and ``huggingface-hub>=0.24,<2``. For ``s3://`` and ``gs://`` artifacts,
 install the corresponding storage provider and filesystem dependency. Select
-the Airflow connection in the URI, for example
+the matching Airflow connection in the URI's user-info section, for example
 ``s3://aws_default@my-bucket/path/data.json`` or
 ``gs://google_cloud_default@my-bucket/path/data.json``. Without a connection
-ID in the URI, the filesystem uses its default credential chain.
+ID in the URI, the filesystem uses its default credential chain; configuring
+an Airflow connection alone does not select it.
 
 Guides
 ------

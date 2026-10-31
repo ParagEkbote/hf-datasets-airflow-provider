@@ -24,7 +24,7 @@ features, and every other feature class are rejected with ``ValueError``.
 The format is designed for ``file://``, ``s3://``, and ``gs://`` paths through
 Airflow ``ObjectStoragePath``. Remote schemes need their matching Airflow
 storage provider and filesystem dependency installed on every worker. Put the
-Airflow connection ID in the URI's user-info section, such as
+matching Airflow connection ID in the URI's user-info section, such as
 ``s3://aws_default@my-bucket/path/data.json`` or
 ``gs://google_cloud_default@my-bucket/path/data.json``. A bare URI without a
 connection ID uses the filesystem's default credential chain; configuring an
@@ -32,7 +32,10 @@ Airflow connection alone does not select it. Local files require a shared path
 if tasks run on different workers. A failed write can leave an incomplete
 manifest or orphaned split objects; rerunning the writer overwrites those
 objects. Configure object-store lifecycle cleanup for abandoned temporary
-objects. Publication checks the manifest fingerprint before upload.
+objects. Alternatively, set an operator's ``storage_conn_id`` to select the
+Airflow connection for its artifact paths; when set, it takes precedence over
+the connection ID in the URI. Publication checks the manifest fingerprint
+before upload.
 
 The canonical Airflow asset URI for a dataset repository is
 ``hf://datasets/<repo_id>``. Hugging Face Hub supplies ``HfFileSystem`` for
