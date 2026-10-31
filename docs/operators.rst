@@ -60,8 +60,9 @@ The commit message includes an artifact fingerprint marker. Airflow 3.3 and
 later task state store support caches the result when that facility is
 available. The marker also lets a retry find a successfully created data commit
 if the worker exited before saving task state. The task emits an asset event
-with the same commit SHA and URL only after successful publication. Dataset
-card generation and README updates are not part of this operator's scope.
+with the same commit SHA and URL only after successful publication. Publication
+uses Datasets ``push_to_hub``, which rewrites the README's YAML card metadata,
+including ``dataset_info`` and ``configs``, in the push commit.
 
 Example
 -------

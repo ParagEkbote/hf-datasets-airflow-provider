@@ -11,14 +11,11 @@ to retain fingerprint validation and provenance.
 The manifest and per-split SHA-256 checksums detect changed or incomplete artifacts. The manifest preserves column names and order through the serialized Features
 schema and records ``DatasetDict`` split names. Reconstruction uses
 ``Features.from_dict`` and a PyArrow Parquet reader before rebuilding each
-Datasets ``Dataset`` object. Features must be
-representable by the installed Datasets and PyArrow Parquet implementations.
-Arrow primitive, list, struct, and class-label data are the intended supported
-set. Media and extension features (including Image, Audio, Video, and nested
-array features) can have serialization semantics that Parquet cannot retain;
-validate these explicitly for a workload before relying on them. If a feature
-cannot be encoded or reconstructed, the task fails and does not return a
-reference.
+Datasets ``Dataset`` object. The artifact writer enforces a hard feature
+whitelist before writing: only ``Value`` and ``ClassLabel`` features,
+recursively nested in ``Sequence``, list/tuple, and dictionary structures,
+are supported. ``Image``, ``Audio``, ``Video``, ``Array2D`` and other array
+features, and every other feature class are rejected with ``ValueError``.
 
 The format is designed for ``file://``, ``s3://``, and ``gs://`` paths through
 Airflow ``ObjectStoragePath``. Remote schemes need their matching Airflow
