@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["flit_core==4.1.0"]
+build-backend = "flit_core.buildapi"
 
 [project]
 name = "apache-airflow-providers-huggingface"
@@ -19,15 +19,16 @@ classifiers = [
 ]
 dependencies = [
   "apache-airflow>=3.0,<4",
-  "datasets>=3.0,<5",
+  "datasets>=3.4.0,<5",
   "huggingface-hub>=0.24,<2",
 ]
 
 [project.entry-points."apache_airflow_provider"]
 provider_info = "airflow.providers.huggingface.get_provider_info:get_provider_info"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.flit.module]
+name = "airflow.providers.huggingface"
+directory = "src"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

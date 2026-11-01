@@ -14,32 +14,56 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
-"""Provider discovery metadata."""
+
+"""Provider metadata consumed by Airflow's provider manager."""
 
 
 def get_provider_info() -> dict:
+    """Return provider metadata; kept in sync with provider.yaml."""
     return {
         "package-name": "apache-airflow-providers-huggingface",
         "name": "Hugging Face",
         "description": "Load, transform, and publish Hugging Face Datasets.",
+        "state": "ready",
+        "source-date-epoch": 0,
+        "lifecycle": "incubation",
         "versions": ["0.1.0"],
         "integrations": [
-            {"integration-name": "Hugging Face Datasets", "external-doc-url": "https://huggingface.co/docs/datasets/"}
+            {
+                "integration-name": "Hugging Face Datasets",
+                "external-doc-url": "https://huggingface.co/docs/datasets/",
+            }
         ],
         "hooks": [
             {
                 "integration-name": "Hugging Face Datasets",
-                "python-modules": ["airflow.providers.huggingface.hooks.datasets"],
+                "python-modules": ["airflow.providers.huggingface.hooks.huggingface"],
+            }
+        ],
+        "operators": [
+            {
+                "integration-name": "Hugging Face Datasets",
+                "python-modules": ["airflow.providers.huggingface.operators.datasets"],
             }
         ],
         "connection-types": [
             {
                 "connection-type": "huggingface",
-                "hook-class-name": "airflow.providers.huggingface.hooks.datasets.HuggingFaceDatasetsHook",
+                "hook-class-name": "airflow.providers.huggingface.hooks.huggingface.HuggingFaceHook",
                 "hook-name": "Hugging Face",
+                "conn-fields": {},
+                "ui-field-behaviour": {
+                    "hidden-fields": ["host", "schema", "port", "login"],
+                    "relabeling": {"password": "Access token"},
+                },
             }
         ],
-        "operators": [
-            {"integration-name": "Hugging Face Datasets", "python-modules": ["airflow.providers.huggingface.operators.datasets"]}
+        "asset-uris": [
+            {
+                "schemes": ["hf"],
+                "factory": "airflow.providers.huggingface.asset.create_asset",
+                "handler": "airflow.providers.huggingface.asset.sanitize_uri",
+                "to_openlineage_converter": "airflow.providers.huggingface.asset.convert_asset_to_openlineage",
+            }
         ],
     }
