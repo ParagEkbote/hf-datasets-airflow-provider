@@ -56,10 +56,14 @@ Guides
    changelog
 
 The system-test DAGs under ``tests/system/huggingface/`` also serve as runnable
-examples. The read-only workflow uses a pinned public dataset. The publication
-workflows require ``HF_TEST_HUB_ORG`` for a dedicated organization and
-``HF_TEST_HUB_CONN_ID`` (defaults to ``huggingface_default``) for a write-scoped
-connection. ``HF_TEST_WRITE_REPO_ID`` and ``HF_TEST_DURABLE_REPO_ID`` can
-override the base repository names. Each run appends ``SYSTEM_TESTS_ENV_ID``
-(or a generated UUID) to its repository name to avoid collisions. Cleanup tasks
-use ``ALL_DONE`` so they are attempted after failures.
+examples and are collected with pytest through Airflow's ``get_test_run(dag)``
+system-test helper. Run them with the repository's system-test pytest setup.
+The read-only workflow uses a pinned public dataset. The publishing workflow
+uses the ``airflow-hf`` organization by default and requires a write-scoped
+``huggingface_default`` Airflow connection. Set ``HF_TEST_HUB_ORG`` or
+``HF_TEST_HUB_CONN_ID`` to override those defaults. ``HF_TEST_WRITE_REPO_ID``
+and ``HF_TEST_DURABLE_REPO_ID`` can override the base repository names. Each
+run appends ``SYSTEM_TESTS_ENV_ID`` (or a generated UUID) to its repository
+names to avoid collisions. Cleanup tasks use ``ALL_DONE`` so they are attempted
+after failures. On Airflow 3.3 and later, the publishing DAG also checks retry
+reuse of a successful Hub commit.

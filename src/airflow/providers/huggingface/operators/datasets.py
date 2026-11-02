@@ -207,7 +207,8 @@ def _load_artifact(
             feature_data = item["features"]
             feature_order = item.get("feature_order", list(feature_data))
             features = Features.from_dict({key: feature_data[key] for key in feature_order})
-            split_name = item.get("split") or (name if name != "dataset" else None)
+            raw_split = item.get("split") or (name if name != "dataset" else None)
+            split_name = raw_split.split("[")[0] if raw_split and "[" in raw_split else raw_split
             restored = Dataset.from_parquet(
                 str(local_path),
                 features=features,

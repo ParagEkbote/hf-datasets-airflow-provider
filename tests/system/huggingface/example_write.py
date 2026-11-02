@@ -18,6 +18,8 @@
 import os
 import uuid
 
+import airflow
+from packaging.version import Version
 from airflow.sdk import Asset, DAG, get_current_context, task
 from airflow.providers.common.compat.sdk import TriggerRule
 
@@ -28,10 +30,14 @@ from airflow.providers.huggingface.operators.datasets import (
     PushToHubOperator,
 )
 
-HUB_ORG = os.environ.get("HF_TEST_HUB_ORG", "configure-org")
+HUB_ORG = os.environ.get("HF_TEST_HUB_ORG", "airflow-hf")
 SYSTEM_TESTS_ENV_ID = os.environ.get("SYSTEM_TESTS_ENV_ID", uuid.uuid4().hex)
 REPO_BASE = os.environ.get("HF_TEST_WRITE_REPO_ID", f"{HUB_ORG}/airflow-provider-system-write")
 REPO_ID = f"{REPO_BASE}-{SYSTEM_TESTS_ENV_ID}"
+REPO_DURABLE_BASE = os.environ.get(
+    "HF_TEST_DURABLE_REPO_ID", f"{HUB_ORG}/airflow-provider-system-durable"
+)
+REPO_DURABLE_ID = f"{REPO_DURABLE_BASE}-{SYSTEM_TESTS_ENV_ID}"
 CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_default")
 REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
 PUBLISHED_ASSET = Asset(uri=f"hf://datasets/{REPO_ID}")
@@ -41,11 +47,25 @@ def keep_columns(example):
     return {"sentence": example["sentence1"], "label": example["label"]}
 
 
+def add_row_marker(example):
+    return {"row_marker": "durable-retry-test"}
+
+
+class FailAfterSuccessfulFirstPushOperator(PushToHubOperator):
+    """Raise after the first successful commit; retries must reuse that commit."""
+
+    def execute(self, context):
+        result = super().execute(context)
+        if context["ti"].try_number == 1:
+            raise RuntimeError("intentional post-publication failure for retry test")
+        return result
+
+
 with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"]) as dag:
 
     @task
     def create_private_repo():
-        if HUB_ORG == "configure-org":
+        if not HUB_ORG:
             raise RuntimeError("Set HF_TEST_HUB_ORG to a dedicated Hub test organization")
         HuggingFaceHook(CONN_ID).get_conn().create_repo(
             REPO_ID, repo_type="dataset", private=True, exist_ok=False
@@ -96,10 +116,65 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
     created >> load >> mapped >> publish >> verified
     [created, publish, verified] >> cleanup
 
+    if Version(airflow.__version__) >= Version("3.3"):
+
+        @task
+        def create_durable_repo():
+            if not HUB_ORG:
+                raise RuntimeError("Set HF_TEST_HUB_ORG to a dedicated Hub test organization")
+            HuggingFaceHook(CONN_ID).get_conn().create_repo(
+                REPO_DURABLE_ID, repo_type="dataset", private=True, exist_ok=False
+            )
+            return REPO_DURABLE_ID
+
+        durable_mapped = MapDatasetOperator(
+            task_id="map_for_durable_retry",
+            input_uri=load.output,
+            output_uri="file:///tmp/hf-provider-system/durable-mapped.json",
+            transform=add_row_marker,
+        )
+        durable_publish = FailAfterSuccessfulFirstPushOperator(
+            task_id="publish_then_fail_once",
+            input_uri=durable_mapped.output,
+            repo_id=REPO_DURABLE_ID,
+            private=True,
+            retries=1,
+            retry_delay=0,
+            huggingface_conn_id=CONN_ID,
+        )
+
+        @task
+        def verify_single_data_commit(mapped_ref, publication):
+            fingerprint = mapped_ref["fingerprint"]
+            marker_prefix = f"airflow-artifact-sha256:{fingerprint}:target:"
+            commits = HuggingFaceHook(CONN_ID).get_conn().list_repo_commits(
+                REPO_DURABLE_ID, repo_type="dataset"
+            )
+            matches = [
+                commit
+                for commit in commits
+                if marker_prefix in (getattr(commit, "title", "") or "")
+                and HuggingFaceHook._commit_is_complete(commit)
+            ]
+            assert len(matches) == 1
+            assert publication["commit_sha"] == matches[0].commit_id
+
+        @task(trigger_rule=TriggerRule.ALL_DONE)
+        def delete_durable_repo(created_repo):
+            if created_repo:
+                HuggingFaceHook(CONN_ID).get_conn().delete_repo(created_repo, repo_type="dataset")
+
+        durable_created = create_durable_repo()
+        durable_verified = verify_single_data_commit(durable_mapped.output, durable_publish.output)
+        durable_cleanup = delete_durable_repo(durable_created)
+        durable_created >> load >> durable_mapped >> durable_publish >> durable_verified
+        [durable_created, durable_publish, durable_verified] >> durable_cleanup
+
     from tests_common.test_utils.watcher import watcher
 
     list(dag.tasks) >> watcher()
 
-from tests_common.test_utils.system_tests import get_test_run
+# Needed to run the example DAG with pytest (see: tests/system/README.md)
+from tests_common.test_utils.system_tests import get_test_run  # noqa: E402
 
 test_run = get_test_run(dag)
