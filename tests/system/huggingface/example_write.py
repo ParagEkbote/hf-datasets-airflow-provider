@@ -40,7 +40,60 @@ REPO_DURABLE_BASE = os.environ.get(
 REPO_DURABLE_ID = f"{REPO_DURABLE_BASE}-{SYSTEM_TESTS_ENV_ID}"
 CONN_ID = os.environ.get("HF_TEST_HUB_CONN_ID", "huggingface_default")
 REVISION = "bcdcba79d07bc864c1c254ccfcedcce55bcc9a8c"
+
 PUBLISHED_ASSET = Asset(uri=f"hf://datasets/{REPO_ID}")
+DURABLE_ASSET = Asset(uri=f"hf://datasets/{REPO_DURABLE_ID}")
+
+
+def _activate_asset(asset: Asset):
+    """Register and activate an asset directly in the Airflow database for test runs."""
+    try:
+        from airflow.models.asset import AssetActive, AssetModel
+        from airflow.settings import Session
+
+        with Session() as session:
+            # 1. Upsert AssetModel
+            asset_model = (
+                session.query(AssetModel)
+                .filter((AssetModel.name == asset.name) | (AssetModel.uri == asset.uri))
+                .first()
+            )
+            if not asset_model:
+                asset_model = AssetModel(name=asset.name, uri=asset.uri)
+                session.add(asset_model)
+                session.flush()
+
+            # 2. Upsert AssetActive
+            active_entry = (
+                session.query(AssetActive)
+                .filter((AssetActive.name == asset.name) | (AssetActive.uri == asset.uri))
+                .first()
+            )
+            if not active_entry:
+                active_entry = AssetActive(name=asset.name, uri=asset.uri)
+                session.add(active_entry)
+
+            session.commit()
+    except ImportError:
+        pass
+
+
+def _deactivate_asset(asset: Asset):
+    """Clean up dynamic test asset records from the DB."""
+    try:
+        from airflow.models.asset import AssetActive, AssetModel
+        from airflow.settings import Session
+
+        with Session() as session:
+            session.query(AssetActive).filter(
+                (AssetActive.name == asset.name) | (AssetActive.uri == asset.uri)
+            ).delete(synchronize_session=False)
+            session.query(AssetModel).filter(
+                (AssetModel.name == asset.name) | (AssetModel.uri == asset.uri)
+            ).delete(synchronize_session=False)
+            session.commit()
+    except ImportError:
+        pass
 
 
 def keep_columns(example):
@@ -70,6 +123,7 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
         HuggingFaceHook(CONN_ID).get_conn().create_repo(
             REPO_ID, repo_type="dataset", private=True, exist_ok=False
         )
+        _activate_asset(PUBLISHED_ASSET)
         return REPO_ID
 
     load = LoadDatasetOperator(
@@ -107,8 +161,11 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
 
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def delete_private_repo(created_repo):
-        if created_repo:
-            HuggingFaceHook(CONN_ID).get_conn().delete_repo(created_repo, repo_type="dataset")
+        try:
+            if created_repo:
+                HuggingFaceHook(CONN_ID).get_conn().delete_repo(created_repo, repo_type="dataset")
+        finally:
+            _deactivate_asset(PUBLISHED_ASSET)
 
     created = create_private_repo()
     verified = verify_xcom_matches_hub_head(publish.output)
@@ -125,6 +182,8 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
             HuggingFaceHook(CONN_ID).get_conn().create_repo(
                 REPO_DURABLE_ID, repo_type="dataset", private=True, exist_ok=False
             )
+            # Activate durable asset for publish_then_fail_once outlet validation
+            _activate_asset(DURABLE_ASSET)
             return REPO_DURABLE_ID
 
         durable_mapped = MapDatasetOperator(
@@ -161,8 +220,11 @@ with DAG(dag_id="huggingface_system_write", tags=["huggingface", "system-test"])
 
         @task(trigger_rule=TriggerRule.ALL_DONE)
         def delete_durable_repo(created_repo):
-            if created_repo:
-                HuggingFaceHook(CONN_ID).get_conn().delete_repo(created_repo, repo_type="dataset")
+            try:
+                if created_repo:
+                    HuggingFaceHook(CONN_ID).get_conn().delete_repo(created_repo, repo_type="dataset")
+            finally:
+                _deactivate_asset(DURABLE_ASSET)
 
         durable_created = create_durable_repo()
         durable_verified = verify_single_data_commit(durable_mapped.output, durable_publish.output)
