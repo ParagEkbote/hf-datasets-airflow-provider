@@ -4,6 +4,12 @@
 
 Apache Airflow provider with operators to load, transform, stream, and publish Hugging Face Datasets.
 
+> [!TIP]
+> This project has been contributed upstream to Apache Airflow. All new development will take place in the [Hugging Face provider](https://github.com/apache/airflow/tree/main/providers/huggingface).
+
+> [!WARNING]
+> Please file issues in the [apache/airflow repository](https://github.com/apache/airflow/issues).
+
 ## Compatibility
 
 This release targets Airflow 3.x (`apache-airflow>=3.0,<4`) and Python 3.10–3.13. It uses Datasets 3.x/4.x and `huggingface-hub` 0.x/1.x public APIs. The provider is not published on PyPI. Install it from this repository into the same Python environment as Airflow:
