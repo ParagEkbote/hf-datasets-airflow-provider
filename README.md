@@ -1,14 +1,12 @@
+> [!WARNING]
+> This project has been contributed upstream to Apache Airflow. All new development will take place in the [official Hugging Face provider](https://github.com/apache/airflow/tree/main/providers/huggingface).
+> Please file issues in the [apache/airflow repository](https://github.com/apache/airflow/issues).
+
 # Apache Airflow provider for Hugging Face Datasets
 
 ![Hero Img](<docs/images/Apache Airflow ❤️ Hugging Face Datasets.png>)
 
 Apache Airflow provider with operators to load, transform, stream, and publish Hugging Face Datasets.
-
-> [!TIP]
-> This project has been contributed upstream to Apache Airflow. All new development will take place in the [Hugging Face provider](https://github.com/apache/airflow/tree/main/providers/huggingface).
-
-> [!WARNING]
-> Please file issues in the [apache/airflow repository](https://github.com/apache/airflow/issues).
 
 ## Compatibility
 
